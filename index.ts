@@ -775,6 +775,64 @@ app.get(
 );
 
 /* =========================================================
+   GET single doctor details
+========================================================= */
+
+app.get(
+  "/api/v1/admin/doctors/:doctorId",
+  verifyToken,
+  verifyAdmin,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+
+      if (!doctorId) {
+        res.status(400).json({
+          success: false,
+          message: "Doctor ID is required",
+        });
+
+        return;
+      }
+
+      const doctorsCollection = database.collection("doctors");
+
+      const doctor = await doctorsCollection.findOne(getDoctorFilter(doctorId));
+
+      if (!doctor) {
+        res.status(404).json({
+          success: false,
+          message: "Doctor was not found",
+        });
+
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        doctor: formatDoctor(doctor),
+      });
+    } catch (error) {
+      console.error("Get doctor details error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve doctor details",
+      });
+    }
+  },
+);
+
+/* =========================================================
    POST create doctor
 ========================================================= */
 
