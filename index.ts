@@ -615,7 +615,7 @@ const formatDoctor = (doctor: Document) => {
 
     experienceYears: getDoctorNumber(doctor.experienceYears),
 
-    chamber: getDoctorString(doctor.chamber),
+    hospital: getDoctorString(doctor.hospital),
 
     address: getDoctorString(doctor.address),
 
@@ -1004,7 +1004,7 @@ app.post(
 
         experienceYears: getDoctorNumber(req.body.experienceYears),
 
-        chamber: getDoctorString(req.body.chamber),
+        hospital: getDoctorString(req.body.hospital),
 
         address: getDoctorString(req.body.address),
 
@@ -1183,7 +1183,7 @@ app.patch(
 
             experienceYears: getDoctorNumber(req.body.experienceYears),
 
-            chamber: getDoctorString(req.body.chamber),
+            hospital: getDoctorString(req.body.hospital),
 
             address: getDoctorString(req.body.address),
 
