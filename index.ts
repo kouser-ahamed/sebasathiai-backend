@@ -1609,6 +1609,7 @@ const formatAppointment = (appointment: Document) => {
     patientUserId: getDoctorString(appointment.patientUserId),
     patientName: getDoctorString(appointment.patientName),
     patientEmail: normalizeDoctorEmail(appointment.patientEmail),
+    patientImage: getDoctorString(appointment.patientImage) || null,
     phone: getDoctorString(appointment.phone),
     address: getDoctorString(appointment.address),
     problemTitle: getDoctorString(appointment.problemTitle),
@@ -1621,9 +1622,88 @@ const formatAppointment = (appointment: Document) => {
       appointment.status === "rejected"
         ? appointment.status
         : "pending",
+    rejectionReason: getDoctorString(appointment.rejectionReason) || null,
+    approvedAt: formatDoctorDate(appointment.approvedAt),
+    completedAt: formatDoctorDate(appointment.completedAt),
+    rejectedAt: formatDoctorDate(appointment.rejectedAt),
+    rescheduledAt: formatDoctorDate(appointment.rescheduledAt),
+    rescheduledBy: getDoctorString(appointment.rescheduledBy) || null,
+    rescheduleReason: getDoctorString(appointment.rescheduleReason) || null,
     createdAt: formatDoctorDate(appointment.createdAt),
     updatedAt: formatDoctorDate(appointment.updatedAt),
   };
+};
+
+const attachPatientImages = async (
+  appointments: Document[],
+): Promise<Document[]> => {
+  if (!database || appointments.length === 0) {
+    return appointments;
+  }
+
+  const patientUserIds = Array.from(
+    new Set(
+      appointments
+        .map((appointment) => getDoctorString(appointment.patientUserId))
+        .filter(Boolean),
+    ),
+  );
+
+  if (patientUserIds.length === 0) {
+    return appointments;
+  }
+
+  const objectIds = patientUserIds
+    .filter((userId) => ObjectId.isValid(userId))
+    .map((userId) => new ObjectId(userId));
+
+  const userConditions: Filter<Document>[] = [
+    {
+      id: {
+        $in: patientUserIds,
+      },
+    },
+  ];
+
+  if (objectIds.length > 0) {
+    userConditions.push({
+      _id: {
+        $in: objectIds,
+      },
+    });
+  }
+
+  const users = await database
+    .collection("user")
+    .find(
+      {
+        $or: userConditions,
+      },
+      {
+        projection: {
+          id: 1,
+          image: 1,
+        },
+      },
+    )
+    .toArray();
+
+  const imageByUserId = new Map<string, string | null>();
+
+  users.forEach((user) => {
+    imageByUserId.set(
+      getDoctorDocumentId(user),
+      getDoctorString(user.image) || null,
+    );
+  });
+
+  return appointments.map((appointment) => ({
+    ...appointment,
+    patientImage:
+      getDoctorString(appointment.patientImage) ||
+      imageByUserId.get(getDoctorString(appointment.patientUserId)) ||
+      null,
+  }));
 };
 
 /* =========================================================
@@ -2639,6 +2719,7 @@ app.post(
         patientUserId,
         patientName,
         patientEmail: normalizeDoctorEmail(currentUser.email),
+        patientImage: getDoctorString(currentUser.image) || null,
         phone,
         address,
         problemTitle,
@@ -2805,7 +2886,7 @@ const sendAppointmentList = async (
   }
 
   const page = getPositiveInteger(req.query.page, 1, 100000);
-  const limit = getPositiveInteger(req.query.limit, 20, 100);
+  const limit = 10;
 
   const queryFilter = getAppointmentListFilter(req);
 
@@ -2819,9 +2900,8 @@ const sendAppointmentList = async (
     appointmentsCollection
       .find(filter)
       .sort({
-        appointmentDate: 1,
-        appointmentTime: 1,
         createdAt: -1,
+        _id: -1,
       })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -2830,9 +2910,12 @@ const sendAppointmentList = async (
     appointmentsCollection.countDocuments(filter),
   ]);
 
+  const appointmentsWithImages =
+    await attachPatientImages(appointmentDocuments);
+
   res.status(200).json({
     success: true,
-    appointments: appointmentDocuments.map(formatAppointment),
+    appointments: appointmentsWithImages.map(formatAppointment),
     pagination: {
       page,
       limit,
@@ -2911,6 +2994,364 @@ app.get(
 );
 
 /* =========================================================
+   Doctor single appointment details
+========================================================= */
+
+app.get(
+  "/api/v1/doctor/appointments/:appointmentId",
+  verifyToken,
+  verifyDoctor,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const appointmentId = getDoctorString(req.params.appointmentId);
+
+      if (!appointmentId) {
+        res.status(400).json({
+          success: false,
+          message: "Appointment ID is required",
+        });
+
+        return;
+      }
+
+      const doctorUserId = getDoctorDocumentId(currentUser);
+
+      const appointment = await database.collection("appointments").findOne({
+        $and: [
+          getDoctorFilter(appointmentId),
+          {
+            doctorUserId,
+          },
+        ],
+      });
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+
+        return;
+      }
+
+      const [appointmentWithImage] = await attachPatientImages([appointment]);
+
+      res.status(200).json({
+        success: true,
+        appointment: formatAppointment(appointmentWithImage),
+      });
+    } catch (error) {
+      console.error("Get doctor appointment details error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve appointment details",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Admin or doctor appointment status update
+========================================================= */
+
+/* =========================================================
+   Doctor appointment reschedule
+========================================================= */
+
+app.patch(
+  "/api/v1/doctor/appointments/:appointmentId/reschedule",
+  verifyToken,
+  verifyDoctor,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const appointmentId = getDoctorString(req.params.appointmentId);
+
+      const appointmentDate = getDoctorString(req.body.appointmentDate);
+
+      const appointmentTime = getDoctorString(req.body.appointmentTime);
+
+      const rescheduleReason = getDoctorString(req.body.rescheduleReason);
+
+      const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+      const timePattern = /^\d{2}:\d{2}$/;
+
+      if (
+        !datePattern.test(appointmentDate) ||
+        !timePattern.test(appointmentTime)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "A valid appointment date and time are required",
+        });
+
+        return;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      if (appointmentDate < today) {
+        res.status(400).json({
+          success: false,
+          message: "Appointment date cannot be in the past",
+        });
+
+        return;
+      }
+
+      if (rescheduleReason.length > 1000) {
+        res.status(400).json({
+          success: false,
+          message: "Reschedule reason cannot contain more than 1000 characters",
+        });
+
+        return;
+      }
+
+      const appointmentsCollection = database.collection("appointments");
+
+      const appointment = await appointmentsCollection.findOne(
+        getDoctorFilter(appointmentId),
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+
+        return;
+      }
+
+      const doctorUserId = getDoctorDocumentId(currentUser);
+
+      if (getDoctorString(appointment.doctorUserId) !== doctorUserId) {
+        res.status(403).json({
+          success: false,
+          message: "You can reschedule only your own appointments",
+        });
+
+        return;
+      }
+
+      const currentStatus = getDoctorString(appointment.status);
+
+      if (currentStatus !== "pending" && currentStatus !== "approved") {
+        res.status(409).json({
+          success: false,
+          message: "Only pending or approved appointments can be rescheduled",
+        });
+
+        return;
+      }
+
+      const now = new Date();
+
+      const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
+        {
+          _id: appointment._id,
+        },
+        {
+          $set: {
+            appointmentDate,
+            appointmentTime,
+            rescheduleReason: rescheduleReason || null,
+            rescheduledAt: now,
+            rescheduledBy: doctorUserId,
+            updatedAt: now,
+          },
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      res.status(200).json({
+        success: true,
+        message: "Appointment rescheduled successfully",
+        appointment: updatedAppointment
+          ? formatAppointment(updatedAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Doctor reschedule appointment error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to reschedule appointment",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Admin-only appointment reschedule
+========================================================= */
+
+app.patch(
+  "/api/v1/admin/appointments/:appointmentId/reschedule",
+  verifyToken,
+  verifyAdmin,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const appointmentId = getDoctorString(req.params.appointmentId);
+
+      const appointmentDate = getDoctorString(req.body.appointmentDate);
+
+      const appointmentTime = getDoctorString(req.body.appointmentTime);
+
+      const rescheduleReason = getDoctorString(req.body.rescheduleReason);
+
+      const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+      const timePattern = /^\d{2}:\d{2}$/;
+
+      if (
+        !datePattern.test(appointmentDate) ||
+        !timePattern.test(appointmentTime)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "A valid appointment date and time are required",
+        });
+
+        return;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      if (appointmentDate < today) {
+        res.status(400).json({
+          success: false,
+          message: "Appointment date cannot be in the past",
+        });
+
+        return;
+      }
+
+      if (rescheduleReason.length > 1000) {
+        res.status(400).json({
+          success: false,
+          message: "Reschedule reason cannot contain more than 1000 characters",
+        });
+
+        return;
+      }
+
+      const appointmentsCollection = database.collection("appointments");
+
+      const appointment = await appointmentsCollection.findOne(
+        getDoctorFilter(appointmentId),
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+
+        return;
+      }
+
+      const currentStatus = getDoctorString(appointment.status);
+
+      if (currentStatus === "completed" || currentStatus === "rejected") {
+        res.status(409).json({
+          success: false,
+          message: "A completed or rejected appointment cannot be rescheduled",
+        });
+
+        return;
+      }
+
+      const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
+        {
+          _id: appointment._id,
+        },
+        {
+          $set: {
+            appointmentDate,
+            appointmentTime,
+            rescheduleReason: rescheduleReason || null,
+            rescheduledAt: new Date(),
+            rescheduledBy: req.userId || null,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      res.status(200).json({
+        success: true,
+        message: "Appointment rescheduled successfully",
+        appointment: updatedAppointment
+          ? formatAppointment(updatedAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Reschedule appointment error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to reschedule appointment",
+      });
+    }
+  },
+);
+
+/* =========================================================
    Admin or doctor appointment status update
 ========================================================= */
 
@@ -2964,6 +3405,7 @@ app.patch(
       }
 
       const requestedStatus = getDoctorString(req.body.status);
+      const rejectionReason = getDoctorString(req.body.rejectionReason);
 
       if (
         requestedStatus !== "approved" &&
@@ -2978,7 +3420,27 @@ app.patch(
         return;
       }
 
+      if (requestedStatus === "rejected" && !rejectionReason) {
+        res.status(400).json({
+          success: false,
+          message:
+            "A rejection message is required when rejecting an appointment",
+        });
+
+        return;
+      }
+
+      if (rejectionReason.length > 1000) {
+        res.status(400).json({
+          success: false,
+          message: "Rejection message cannot contain more than 1000 characters",
+        });
+
+        return;
+      }
+
       const appointmentId = getDoctorString(req.params.appointmentId);
+
       const appointmentsCollection = database.collection("appointments");
 
       const appointment = await appointmentsCollection.findOne(
@@ -3027,15 +3489,42 @@ app.patch(
         return;
       }
 
+      if (requestedStatus === "approved" && currentStatus !== "pending") {
+        res.status(409).json({
+          success: false,
+          message: "Only a pending appointment can be approved",
+        });
+
+        return;
+      }
+
+      const now = new Date();
+
+      const statusFields: Record<string, unknown> = {
+        status: requestedStatus as AppointmentStatus,
+        rejectionReason:
+          requestedStatus === "rejected" ? rejectionReason : null,
+        updatedAt: now,
+      };
+
+      if (requestedStatus === "approved") {
+        statusFields.approvedAt = now;
+      }
+
+      if (requestedStatus === "completed") {
+        statusFields.completedAt = now;
+      }
+
+      if (requestedStatus === "rejected") {
+        statusFields.rejectedAt = now;
+      }
+
       const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
         {
           _id: appointment._id,
         },
         {
-          $set: {
-            status: requestedStatus as AppointmentStatus,
-            updatedAt: new Date(),
-          },
+          $set: statusFields,
         },
         {
           returnDocument: "after",
@@ -3119,6 +3608,9 @@ const connectDatabase = async (): Promise<void> => {
     database
       .collection("appointments")
       .createIndex({ doctorUserId: 1, status: 1, appointmentDate: 1 }),
+    database
+      .collection("appointments")
+      .createIndex({ doctorUserId: 1, createdAt: -1 }),
     database
       .collection("appointments")
       .createIndex({ status: 1, appointmentDate: 1, appointmentTime: 1 }),
