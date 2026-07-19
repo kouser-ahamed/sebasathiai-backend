@@ -6457,6 +6457,273 @@ Return ONLY valid JSON:
 );
 
 /* =========================================================
+   Patient AI Health summary history
+   - Active and blocked patients can read their own history.
+   - Only active patients can delete their own history.
+========================================================= */
+
+app.get(
+  "/api/v1/patient/ai-health-history",
+  verifyToken,
+  verifyPatient,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const status = getNormalizedUserStatus(currentUser);
+      const requestedPage = getPositiveInteger(req.query.page, 1, 100000);
+
+      // Patient AI Health History always returns exactly 10 records per page.
+      const limit = 10;
+      const collection = database.collection(AI_HEALTH_HISTORY_COLLECTION);
+      const filter = getAIHealthOwnerFilter(patientUserId);
+      const total = await collection.countDocuments(filter);
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(requestedPage, totalPages);
+
+      const documents = await collection
+        .find(filter)
+        .sort({
+          updatedAt: -1,
+          createdAt: -1,
+          _id: -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        account: {
+          id: patientUserId,
+          name: getDoctorString(currentUser.name),
+          email: normalizeDoctorEmail(currentUser.email),
+          image: getDoctorString(currentUser.image) || null,
+          role: "patient",
+          status,
+        },
+        canDelete: status === "active",
+        histories: documents.map(formatAIHealthHistory),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      });
+    } catch (error) {
+      console.error("Get patient AI Health history error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve patient AI health history",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/v1/patient/ai-health-history/:historyId",
+  verifyToken,
+  verifyPatient,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const historyId = getDoctorString(req.params.historyId);
+
+      if (!historyId) {
+        res.status(400).json({
+          success: false,
+          message: "AI health history ID is required",
+        });
+        return;
+      }
+
+      const history = await database
+        .collection(AI_HEALTH_HISTORY_COLLECTION)
+        .findOne({
+          $and: [
+            getDoctorFilter(historyId),
+            getAIHealthOwnerFilter(patientUserId),
+          ],
+        });
+
+      if (!history) {
+        res.status(404).json({
+          success: false,
+          message: "AI health history was not found",
+        });
+        return;
+      }
+
+      const status = getNormalizedUserStatus(currentUser);
+
+      res.status(200).json({
+        success: true,
+        account: {
+          id: patientUserId,
+          name: getDoctorString(currentUser.name),
+          email: normalizeDoctorEmail(currentUser.email),
+          image: getDoctorString(currentUser.image) || null,
+          role: "patient",
+          status,
+        },
+        canDelete: status === "active",
+        history: formatAIHealthHistory(history),
+      });
+    } catch (error) {
+      console.error("Get patient AI Health history details error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve patient AI health history details",
+      });
+    }
+  },
+);
+
+app.delete(
+  "/api/v1/patient/ai-health-history/:historyId",
+  verifyToken,
+  verifyPatient,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const historyId = getDoctorString(req.params.historyId);
+
+      if (!historyId) {
+        res.status(400).json({
+          success: false,
+          message: "AI health history ID is required",
+        });
+        return;
+      }
+
+      const historyCollection = database.collection(
+        AI_HEALTH_HISTORY_COLLECTION,
+      );
+
+      const history = await historyCollection.findOne({
+        $and: [
+          getDoctorFilter(historyId),
+          getAIHealthOwnerFilter(patientUserId),
+        ],
+      });
+
+      if (!history) {
+        res.status(404).json({
+          success: false,
+          message: "AI health history was not found",
+        });
+        return;
+      }
+
+      const deleteResult = await historyCollection.deleteOne({
+        _id: history._id,
+      });
+
+      if (deleteResult.deletedCount !== 1) {
+        res.status(500).json({
+          success: false,
+          message: "AI health history could not be deleted",
+        });
+        return;
+      }
+
+      const conversationId = getDoctorString(history.conversationId);
+
+      if (conversationId) {
+        await database.collection(AI_HEALTH_CHAT_COLLECTION).updateOne(
+          {
+            $and: [
+              getDoctorFilter(conversationId),
+              getAIHealthOwnerFilter(patientUserId),
+              {
+                summaryHistoryId: historyId,
+              },
+            ],
+          },
+          {
+            $set: {
+              summaryHistoryId: null,
+              summaryReport: null,
+              updatedAt: new Date(),
+            },
+          },
+        );
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "AI health history deleted successfully",
+        deletedHistoryId: historyId,
+      });
+    } catch (error) {
+      console.error("Delete patient AI Health history error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete patient AI health history",
+      });
+    }
+  },
+);
+
+/* =========================================================
    Saved AI Health summary history
 ========================================================= */
 
@@ -6643,6 +6910,12 @@ const connectDatabase = async (): Promise<void> => {
     database
       .collection(AI_HEALTH_HISTORY_COLLECTION)
       .createIndex({ patientUserId: 1, createdAt: -1 }),
+    database
+      .collection(AI_HEALTH_HISTORY_COLLECTION)
+      .createIndex({ userId: 1, updatedAt: -1 }),
+    database
+      .collection(AI_HEALTH_HISTORY_COLLECTION)
+      .createIndex({ patientUserId: 1, updatedAt: -1 }),
     database
       .collection(AI_HEALTH_CHAT_COLLECTION)
       .createIndex({ userId: 1, lastMessageAt: -1 }),
