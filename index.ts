@@ -777,6 +777,361 @@ const getBetterAuthError = (value: unknown): string => {
 };
 
 /* =========================================================
+   Admin patient management helpers
+========================================================= */
+
+type ManagedPatientStatus = "active" | "blocked";
+
+const getAdminPatientFilter = (patientId: string): Filter<Document> => {
+  return {
+    $and: [getUserFilter(patientId), { role: "patient" }],
+  };
+};
+
+const formatManagedPatient = (patient: Document) => {
+  const status: ManagedPatientStatus =
+    patient.status === "blocked" ? "blocked" : "active";
+
+  return {
+    id: getDoctorDocumentId(patient),
+    name: getDoctorString(patient.name),
+    email: normalizeDoctorEmail(patient.email),
+    image: getDoctorString(patient.image) || null,
+    role: "patient" as const,
+    status,
+    emailVerified: patient.emailVerified === true,
+    phone: getDoctorString(patient.phone) || null,
+    address: getDoctorString(patient.address) || null,
+    dateOfBirth: getDoctorString(patient.dateOfBirth) || null,
+    gender: getDoctorString(patient.gender) || null,
+    bloodGroup: getDoctorString(patient.bloodGroup) || null,
+    occupation: getDoctorString(patient.occupation) || null,
+    city: getDoctorString(patient.city) || null,
+    country: getDoctorString(patient.country) || null,
+    bio: getDoctorString(patient.bio) || null,
+    emergencyContactName: getDoctorString(patient.emergencyContactName) || null,
+    emergencyContactPhone:
+      getDoctorString(patient.emergencyContactPhone) ||
+      getDoctorString(patient.emergencyContact) ||
+      null,
+    createdAt: formatDoctorDate(patient.createdAt),
+    updatedAt: formatDoctorDate(patient.updatedAt),
+  };
+};
+
+/* =========================================================
+   GET managed patients (10 per page)
+========================================================= */
+
+app.get(
+  "/api/v1/admin/patients",
+  verifyToken,
+  verifyAdmin,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const search = getDoctorString(req.query.search);
+      const requestedStatus = getDoctorString(req.query.status);
+      const requestedPage = getPositiveInteger(req.query.page, 1, 100000);
+      const limit = 10;
+
+      const conditions: Filter<Document>[] = [{ role: "patient" }];
+
+      if (requestedStatus === "active" || requestedStatus === "blocked") {
+        conditions.push({ status: requestedStatus });
+      }
+
+      if (search) {
+        const safeSearch = escapeDoctorSearch(search);
+
+        conditions.push({
+          $or: [
+            {
+              name: {
+                $regex: safeSearch,
+                $options: "i",
+              },
+            },
+            {
+              email: {
+                $regex: safeSearch,
+                $options: "i",
+              },
+            },
+          ],
+        });
+      }
+
+      const filter: Filter<Document> = { $and: conditions };
+      const usersCollection = database.collection("user");
+      const total = await usersCollection.countDocuments(filter);
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(requestedPage, totalPages);
+
+      const patientDocuments = await usersCollection
+        .find(filter)
+        .sort({
+          updatedAt: -1,
+          createdAt: -1,
+          _id: -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        patients: patientDocuments.map(formatManagedPatient),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      });
+    } catch (error) {
+      console.error("Get managed patients error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve patients",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   GET managed patient details
+========================================================= */
+
+app.get(
+  "/api/v1/admin/patients/:patientId",
+  verifyToken,
+  verifyAdmin,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const patientId = getDoctorString(req.params.patientId);
+
+      if (!patientId) {
+        res.status(400).json({
+          success: false,
+          message: "Patient ID is required",
+        });
+        return;
+      }
+
+      const patient = await database
+        .collection("user")
+        .findOne(getAdminPatientFilter(patientId));
+
+      if (!patient) {
+        res.status(404).json({
+          success: false,
+          message: "Patient was not found",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        patient: formatManagedPatient(patient),
+      });
+    } catch (error) {
+      console.error("Get managed patient details error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve patient details",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   PATCH block or activate patient
+========================================================= */
+
+app.patch(
+  "/api/v1/admin/patients/:patientId/status",
+  verifyToken,
+  verifyAdmin,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const patientId = getDoctorString(req.params.patientId);
+      const requestedStatus = getDoctorString(req.body.status);
+
+      if (requestedStatus !== "active" && requestedStatus !== "blocked") {
+        res.status(400).json({
+          success: false,
+          message: "Status must be active or blocked",
+        });
+        return;
+      }
+
+      const usersCollection = database.collection("user");
+      const patient = await usersCollection.findOne(
+        getAdminPatientFilter(patientId),
+      );
+
+      if (!patient) {
+        res.status(404).json({
+          success: false,
+          message: "Patient was not found",
+        });
+        return;
+      }
+
+      const status = requestedStatus as ManagedPatientStatus;
+      const updatedPatient = await usersCollection.findOneAndUpdate(
+        { _id: patient._id },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        },
+        { returnDocument: "after" },
+      );
+
+      if (!updatedPatient) {
+        res.status(404).json({
+          success: false,
+          message: "Patient was not found",
+        });
+        return;
+      }
+
+      if (status === "blocked") {
+        await database.collection("session").deleteMany({
+          userId: getDoctorDocumentId(patient),
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message:
+          status === "blocked"
+            ? "Patient blocked successfully"
+            : "Patient activated successfully",
+        patient: formatManagedPatient(updatedPatient),
+      });
+    } catch (error) {
+      console.error("Change patient status error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to change patient status",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   DELETE patient account
+========================================================= */
+
+app.delete(
+  "/api/v1/admin/patients/:patientId",
+  verifyToken,
+  verifyAdmin,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const patientId = getDoctorString(req.params.patientId);
+
+      if (!patientId) {
+        res.status(400).json({
+          success: false,
+          message: "Patient ID is required",
+        });
+        return;
+      }
+
+      const usersCollection = database.collection("user");
+      const patient = await usersCollection.findOne(
+        getAdminPatientFilter(patientId),
+      );
+
+      if (!patient) {
+        res.status(404).json({
+          success: false,
+          message: "Patient was not found",
+        });
+        return;
+      }
+
+      const userId = getDoctorDocumentId(patient);
+      const email = normalizeDoctorEmail(patient.email);
+
+      await Promise.all([
+        database.collection("session").deleteMany({ userId }),
+        database.collection("account").deleteMany({ userId }),
+        database.collection("verification").deleteMany({
+          $or: [{ identifier: email }, { value: email }],
+        }),
+      ]);
+
+      const deleteResult = await usersCollection.deleteOne({
+        _id: patient._id,
+      });
+
+      if (deleteResult.deletedCount !== 1) {
+        res.status(500).json({
+          success: false,
+          message: "Patient account could not be deleted",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Patient account deleted successfully",
+        deletedPatientId: userId,
+      });
+    } catch (error) {
+      console.error("Delete patient account error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete patient account",
+      });
+    }
+  },
+);
+
+/* =========================================================
    GET all doctors
 ========================================================= */
 
@@ -6877,6 +7232,11 @@ const connectDatabase = async (): Promise<void> => {
   await database.command({ ping: 1 });
 
   await Promise.all([
+    database
+      .collection("user")
+      .createIndex({ role: 1, status: 1, updatedAt: -1 }),
+    database.collection("user").createIndex({ role: 1, name: 1 }),
+    database.collection("user").createIndex({ role: 1, email: 1 }),
     database
       .collection("doctors")
       .createIndex({ status: 1, ratingAverage: -1, createdAt: -1 }),
