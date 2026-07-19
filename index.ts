@@ -3584,7 +3584,7 @@ app.patch(
           requestedStatus === "approved"
             ? "Appointment approved successfully"
             : requestedStatus === "completed"
-              ? "Consultation completed successfully. The patient can now take another appointment with this doctor."
+              ? "Consultation completed successfully."
               : "Appointment rejected successfully",
         appointment: updatedAppointment
           ? formatAppointment(updatedAppointment)
