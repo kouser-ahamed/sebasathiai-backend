@@ -42,6 +42,8 @@ const groqModel = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 const AI_HEALTH_HISTORY_COLLECTION = "AI-health-History";
 
+const AI_HEALTH_CHAT_COLLECTION = "all-history";
+
 if (!mongoDbUri) {
   throw new Error("MONGODB_URI is missing from the .env file");
 }
@@ -4165,6 +4167,12 @@ interface AIHealthAssistantResponse {
   disclaimer: string;
 }
 
+interface AIHealthStoredMessage extends AIHealthMessage {
+  id: string;
+  assistant?: AIHealthAssistantResponse;
+  createdAt: Date;
+}
+
 interface AIHealthSummaryReport {
   reportTitle: string;
   conciseSummary: string;
@@ -4197,7 +4205,7 @@ const verifyAIHealthRateLimit = (
   const key = req.userId || req.ip || "anonymous";
   const now = Date.now();
   const windowLength = 10 * 60 * 1000;
-  const maximumRequests = 30;
+  const maximumRequests = 40;
   const current = aiHealthRateLimit.get(key);
 
   if (!current || now - current.startedAt >= windowLength) {
@@ -4226,7 +4234,11 @@ const verifyAIHealthRateLimit = (
   next();
 };
 
-const getAIHealthArray = (value: unknown, maximumItems = 8): string[] => {
+const createAIHealthMessageId = (): string => {
+  return new ObjectId().toHexString();
+};
+
+const getAIHealthArray = (value: unknown, maximumItems = 6): string[] => {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -4276,6 +4288,11 @@ const extractAIHealthJson = (content: string): Record<string, unknown> => {
 
 const normalizeAIHealthMessages = (
   value: unknown,
+  options: {
+    requireLatestUser: boolean;
+    maximumMessages?: number;
+    maximumCharacters?: number;
+  },
 ):
   | {
       success: true;
@@ -4292,10 +4309,12 @@ const normalizeAIHealthMessages = (
     };
   }
 
+  const maximumMessages = options.maximumMessages ?? 30;
+  const maximumCharacters = options.maximumCharacters ?? 30000;
   const messages: AIHealthMessage[] = [];
   let totalCharacters = 0;
 
-  for (const rawMessage of value.slice(-20)) {
+  for (const rawMessage of value.slice(-maximumMessages)) {
     if (typeof rawMessage !== "object" || rawMessage === null) {
       continue;
     }
@@ -4317,7 +4336,7 @@ const normalizeAIHealthMessages = (
 
     totalCharacters += content.length;
 
-    if (totalCharacters > 24000) {
+    if (totalCharacters > maximumCharacters) {
       return {
         success: false,
         message:
@@ -4338,7 +4357,17 @@ const normalizeAIHealthMessages = (
     };
   }
 
-  if (messages[messages.length - 1]?.role !== "user") {
+  if (!messages.some((message) => message.role === "user")) {
+    return {
+      success: false,
+      message: "At least one user symptom message is required",
+    };
+  }
+
+  if (
+    options.requireLatestUser &&
+    messages[messages.length - 1]?.role !== "user"
+  ) {
     return {
       success: false,
       message: "The latest conversation message must be from the user",
@@ -4349,6 +4378,55 @@ const normalizeAIHealthMessages = (
     success: true,
     messages,
   };
+};
+
+const getStoredAIHealthMessages = (value: unknown): AIHealthStoredMessage[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((rawMessage): AIHealthStoredMessage | null => {
+      if (typeof rawMessage !== "object" || rawMessage === null) {
+        return null;
+      }
+
+      const message = rawMessage as Record<string, unknown>;
+      const role = message.role;
+      const content = getDoctorString(message.content);
+
+      if ((role !== "user" && role !== "assistant") || !content) {
+        return null;
+      }
+
+      const assistant =
+        typeof message.assistant === "object" && message.assistant !== null
+          ? formatAIHealthAssistantResponse(
+              message.assistant as Record<string, unknown>,
+              false,
+            )
+          : undefined;
+
+      const createdAtValue = message.createdAt;
+      const createdAt =
+        createdAtValue instanceof Date
+          ? createdAtValue
+          : new Date(
+              typeof createdAtValue === "string" ||
+                typeof createdAtValue === "number"
+                ? createdAtValue
+                : Date.now(),
+            );
+
+      return {
+        id: getDoctorString(message.id) || createAIHealthMessageId(),
+        role,
+        content,
+        ...(assistant ? { assistant } : {}),
+        createdAt: Number.isNaN(createdAt.getTime()) ? new Date() : createdAt,
+      };
+    })
+    .filter((message): message is AIHealthStoredMessage => message !== null);
 };
 
 const hasEmergencyWarning = (messages: AIHealthMessage[]): boolean => {
@@ -4389,6 +4467,7 @@ const callGroqAI = async (
     content: string;
   }>,
   temperature: number,
+  maximumOutputTokens: number,
 ): Promise<Record<string, unknown>> => {
   if (!groqApiKey) {
     throw new Error("GROQ_API_KEY is missing from the backend .env file");
@@ -4405,7 +4484,7 @@ const callGroqAI = async (
       model: groqModel,
       messages,
       temperature,
-      max_completion_tokens: 1400,
+      max_completion_tokens: maximumOutputTokens,
       response_format: {
         type: "json_object",
       },
@@ -4465,25 +4544,25 @@ const formatAIHealthAssistantResponse = (
 
   const reply =
     getDoctorString(data.reply) ||
-    "I could not prepare a complete response. Please share your symptoms, duration and severity more clearly.";
+    "Please describe the symptoms, duration and severity a little more clearly.";
 
   return {
     reply,
     urgencyLevel,
-    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 5),
-    recommendedActions: getAIHealthArray(data.recommendedActions, 6),
+    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 2),
+    recommendedActions: getAIHealthArray(data.recommendedActions, 3),
     warningSigns: emergencyDetected
       ? Array.from(
           new Set([
             "Your description may include an emergency warning sign.",
-            ...getAIHealthArray(data.warningSigns, 6),
+            ...getAIHealthArray(data.warningSigns, 3),
           ]),
-        )
-      : getAIHealthArray(data.warningSigns, 6),
-    followUpQuestions: getAIHealthArray(data.followUpQuestions, 5),
+        ).slice(0, 3)
+      : getAIHealthArray(data.warningSigns, 3),
+    followUpQuestions: getAIHealthArray(data.followUpQuestions, 2),
     disclaimer:
       getDoctorString(data.disclaimer) ||
-      "This AI response provides general health information only and is not a diagnosis, prescription or substitute for a qualified medical professional.",
+      "General guidance only; this is not a diagnosis or prescription.",
   };
 };
 
@@ -4496,22 +4575,102 @@ const formatAIHealthSummary = (
     conciseSummary:
       getDoctorString(data.conciseSummary) ||
       "A concise summary could not be generated.",
-    chiefConcerns: getAIHealthArray(data.chiefConcerns, 8),
-    symptoms: getAIHealthArray(data.symptoms, 12),
+    chiefConcerns: getAIHealthArray(data.chiefConcerns, 6),
+    symptoms: getAIHealthArray(data.symptoms, 10),
     durationAndPattern:
       getDoctorString(data.durationAndPattern) || "Not clearly stated",
     severity: getDoctorString(data.severity) || "Not clearly stated",
     urgencyLevel: getAIHealthUrgency(data.urgencyLevel),
-    redFlags: getAIHealthArray(data.redFlags, 8),
-    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 6),
-    selfCareGuidance: getAIHealthArray(data.selfCareGuidance, 8),
-    questionsForDoctor: getAIHealthArray(data.questionsForDoctor, 8),
+    redFlags: getAIHealthArray(data.redFlags, 6),
+    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 5),
+    selfCareGuidance: getAIHealthArray(data.selfCareGuidance, 6),
+    questionsForDoctor: getAIHealthArray(data.questionsForDoctor, 6),
     emergencyAdvice:
       getDoctorString(data.emergencyAdvice) ||
       "Seek urgent in-person medical care if symptoms become severe or new warning signs appear.",
     disclaimer:
       getDoctorString(data.disclaimer) ||
-      "This AI-generated summary is not a diagnosis or prescription. A qualified healthcare professional must review the symptoms and make clinical decisions.",
+      "This AI-generated summary is not a diagnosis or prescription.",
+  };
+};
+
+const createAIHealthConversationTitle = (message: string): string => {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  const words = normalized.split(" ").filter(Boolean).slice(0, 7);
+  const title = words.join(" ");
+
+  if (!title) {
+    return "New health chat";
+  }
+
+  return normalized.length > title.length ? `${title}…` : title;
+};
+
+const getAIHealthOwnerFilter = (userId: string): Filter<Document> => {
+  return {
+    $or: [
+      {
+        userId,
+      },
+      {
+        patientUserId: userId,
+      },
+    ],
+  };
+};
+
+const formatAIHealthConversationMessage = (message: AIHealthStoredMessage) => {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    assistant: message.assistant || null,
+    createdAt: formatDoctorDate(message.createdAt),
+  };
+};
+
+const formatAIHealthConversation = (conversation: Document) => {
+  const userId =
+    getDoctorString(conversation.userId) ||
+    getDoctorString(conversation.patientUserId);
+
+  const userRole: UserRole =
+    conversation.userRole === "admin" ||
+    conversation.userRole === "doctor" ||
+    conversation.userRole === "patient"
+      ? conversation.userRole
+      : "patient";
+
+  const messages = getStoredAIHealthMessages(conversation.messages);
+
+  return {
+    id: getDoctorDocumentId(conversation),
+    title: getDoctorString(conversation.title) || "New health chat",
+    userId,
+    userRole,
+    userName:
+      getDoctorString(conversation.userName) ||
+      getDoctorString(conversation.patientName),
+    userEmail:
+      normalizeDoctorEmail(conversation.userEmail) ||
+      normalizeDoctorEmail(conversation.patientEmail),
+    userImage:
+      getDoctorString(conversation.userImage) ||
+      getDoctorString(conversation.patientImage) ||
+      null,
+    messages: messages.map(formatAIHealthConversationMessage),
+    messageCount: messages.length,
+    summaryHistoryId: getDoctorString(conversation.summaryHistoryId) || null,
+    summaryReport:
+      typeof conversation.summaryReport === "object" &&
+      conversation.summaryReport !== null
+        ? conversation.summaryReport
+        : null,
+    createdAt: formatDoctorDate(conversation.createdAt),
+    updatedAt: formatDoctorDate(conversation.updatedAt),
+    lastMessageAt: formatDoctorDate(
+      conversation.lastMessageAt || conversation.updatedAt,
+    ),
   };
 };
 
@@ -4535,6 +4694,8 @@ const formatAIHealthHistory = (history: Document) => {
 
   return {
     id: getDoctorDocumentId(history),
+    conversationId: getDoctorString(history.conversationId) || null,
+    conversationTitle: getDoctorString(history.conversationTitle) || null,
     userId,
     userRole,
     userName,
@@ -4543,12 +4704,9 @@ const formatAIHealthHistory = (history: Document) => {
       getDoctorString(history.userImage) ||
       getDoctorString(history.patientImage) ||
       null,
-
-    // Backward-compatible fields for previously generated frontend code.
     patientUserId: userId,
     patientName: userName,
     patientEmail: userEmail,
-
     provider: getDoctorString(history.provider),
     model: getDoctorString(history.model),
     report:
@@ -4559,6 +4717,19 @@ const formatAIHealthHistory = (history: Document) => {
     createdAt: formatDoctorDate(history.createdAt),
     updatedAt: formatDoctorDate(history.updatedAt),
   };
+};
+
+const getAIHealthConversationForUser = async (
+  userId: string,
+  conversationId: string,
+): Promise<Document | null> => {
+  if (!database || !conversationId) {
+    return null;
+  }
+
+  return database.collection(AI_HEALTH_CHAT_COLLECTION).findOne({
+    $and: [getDoctorFilter(conversationId), getAIHealthOwnerFilter(userId)],
+  });
 };
 
 /* =========================================================
@@ -4615,7 +4786,445 @@ app.get(
 );
 
 /* =========================================================
-   AI Health chat
+   AI Health conversation history
+========================================================= */
+
+app.get(
+  "/api/v1/ai-health/conversations",
+  verifyToken,
+  verifyAnyActiveUser,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const userId = getDoctorDocumentId(currentUser);
+      const limit = getPositiveInteger(req.query.limit, 100, 100);
+      const conversations = await database
+        .collection(AI_HEALTH_CHAT_COLLECTION)
+        .find(getAIHealthOwnerFilter(userId))
+        .sort({
+          lastMessageAt: -1,
+          updatedAt: -1,
+          _id: -1,
+        })
+        .limit(limit)
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        conversations: conversations.map(formatAIHealthConversation),
+      });
+    } catch (error) {
+      console.error("Get AI conversations error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve AI conversations",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/v1/ai-health/conversations",
+  verifyToken,
+  verifyAnyActiveUser,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const now = new Date();
+      const userId = getDoctorDocumentId(currentUser);
+      const userRole = getNormalizedUserRole(currentUser);
+      const userName = getDoctorString(currentUser.name);
+      const userEmail = normalizeDoctorEmail(currentUser.email);
+      const userImage = getDoctorString(currentUser.image) || null;
+      const requestedTitle = getDoctorString(req.body.title).slice(0, 80);
+
+      const conversationDocument = {
+        title: requestedTitle || "New health chat",
+        userId,
+        userRole,
+        userName,
+        userEmail,
+        userImage,
+        patientUserId: userId,
+        patientName: userName,
+        patientEmail: userEmail,
+        patientImage: userImage,
+        messages: [] as AIHealthStoredMessage[],
+        summaryHistoryId: null,
+        summaryReport: null,
+        createdAt: now,
+        updatedAt: now,
+        lastMessageAt: now,
+      };
+
+      const collection = database.collection(AI_HEALTH_CHAT_COLLECTION);
+      const insertResult = await collection.insertOne(conversationDocument);
+      const conversation = await collection.findOne({
+        _id: insertResult.insertedId,
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "New AI health conversation created",
+        conversation: conversation
+          ? formatAIHealthConversation(conversation)
+          : {
+              id: insertResult.insertedId.toHexString(),
+              ...conversationDocument,
+              messageCount: 0,
+            },
+      });
+    } catch (error) {
+      console.error("Create AI conversation error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to create AI conversation",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/v1/ai-health/conversations/:conversationId",
+  verifyToken,
+  verifyAnyActiveUser,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const conversation = await getAIHealthConversationForUser(
+        getDoctorDocumentId(currentUser),
+        getDoctorString(req.params.conversationId),
+      );
+
+      if (!conversation) {
+        res.status(404).json({
+          success: false,
+          message: "AI health conversation was not found",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        conversation: formatAIHealthConversation(conversation),
+      });
+    } catch (error) {
+      console.error("Get AI conversation details error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve AI conversation",
+      });
+    }
+  },
+);
+
+app.delete(
+  "/api/v1/ai-health/conversations/:conversationId",
+  verifyToken,
+  verifyAnyActiveUser,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const userId = getDoctorDocumentId(currentUser);
+      const conversationId = getDoctorString(req.params.conversationId);
+      const conversation = await getAIHealthConversationForUser(
+        userId,
+        conversationId,
+      );
+
+      if (!conversation) {
+        res.status(404).json({
+          success: false,
+          message: "AI health conversation was not found",
+        });
+        return;
+      }
+
+      await database.collection(AI_HEALTH_CHAT_COLLECTION).deleteOne({
+        _id: conversation._id,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "AI health conversation deleted successfully",
+        deletedConversationId: conversationId,
+      });
+    } catch (error) {
+      console.error("Delete AI conversation error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete AI conversation",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   AI Health persistent message exchange
+========================================================= */
+
+app.post(
+  "/api/v1/ai-health/conversations/:conversationId/messages",
+  verifyToken,
+  verifyAnyActiveUser,
+  verifyAIHealthRateLimit,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const userId = getDoctorDocumentId(currentUser);
+      const conversationId = getDoctorString(req.params.conversationId);
+      const content = getDoctorString(req.body.message);
+
+      if (!content) {
+        res.status(400).json({
+          success: false,
+          message: "A health message is required",
+        });
+        return;
+      }
+
+      if (content.length > 4000) {
+        res.status(400).json({
+          success: false,
+          message: "A message cannot contain more than 4000 characters",
+        });
+        return;
+      }
+
+      const conversation = await getAIHealthConversationForUser(
+        userId,
+        conversationId,
+      );
+
+      if (!conversation) {
+        res.status(404).json({
+          success: false,
+          message: "AI health conversation was not found",
+        });
+        return;
+      }
+
+      const existingMessages = getStoredAIHealthMessages(conversation.messages);
+      const now = new Date();
+      const userMessage: AIHealthStoredMessage = {
+        id: createAIHealthMessageId(),
+        role: "user",
+        content,
+        createdAt: now,
+      };
+
+      const nextTitle =
+        existingMessages.some((message) => message.role === "user") ||
+        getDoctorString(conversation.title) !== "New health chat"
+          ? getDoctorString(conversation.title) || "New health chat"
+          : createAIHealthConversationTitle(content);
+
+      const collection = database.collection(AI_HEALTH_CHAT_COLLECTION);
+
+      const contextMessages: AIHealthMessage[] = [
+        ...existingMessages.map(({ role, content: savedContent }) => ({
+          role,
+          content: savedContent,
+        })),
+        {
+          role: "user",
+          content,
+        },
+      ];
+
+      const validation = normalizeAIHealthMessages(contextMessages, {
+        requireLatestUser: true,
+        maximumMessages: 22,
+        maximumCharacters: 26000,
+      });
+
+      if (!validation.success) {
+        res.status(400).json({
+          success: false,
+          message: validation.message,
+        });
+        return;
+      }
+
+      const emergencyDetected = hasEmergencyWarning(validation.messages);
+      const userName = getDoctorString(currentUser.name) || "User";
+
+      const systemPrompt = `You are SebaSathi AI Health Assistant for a Bangladesh-oriented healthcare platform. The user's name is ${userName}.
+
+Give cautious general health guidance and suggest an appropriate doctor category. Never diagnose, prescribe medicines, give doses, or tell the user to stop prescribed treatment.
+
+Keep every response compact:
+- reply: maximum 3 short sentences and preferably under 80 words
+- suggestedSpecialists: maximum 2
+- recommendedActions: maximum 3
+- warningSigns: maximum 3
+- followUpQuestions: maximum 2
+- avoid repeating the same disclaimer or advice in multiple fields
+- match Bangla, Banglish, or English used by the user
+- emergency warning signs require immediate emergency-care advice
+
+Return ONLY valid JSON:
+{
+  "reply": "brief empathetic answer",
+  "urgencyLevel": "routine | soon | urgent | emergency",
+  "suggestedSpecialists": ["maximum two specialist categories"],
+  "recommendedActions": ["maximum three concise actions"],
+  "warningSigns": ["maximum three warning signs"],
+  "followUpQuestions": ["maximum two useful questions"],
+  "disclaimer": "one short disclaimer"
+}`;
+
+      const groqData = await callGroqAI(
+        [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          ...validation.messages,
+        ],
+        0.2,
+        650,
+      );
+
+      const assistant = formatAIHealthAssistantResponse(
+        groqData,
+        emergencyDetected,
+      );
+
+      const assistantMessage: AIHealthStoredMessage = {
+        id: createAIHealthMessageId(),
+        role: "assistant",
+        content: assistant.reply,
+        assistant,
+        createdAt: new Date(),
+      };
+
+      const updatedConversation = await collection.findOneAndUpdate(
+        {
+          _id: conversation._id,
+        },
+        {
+          $set: {
+            title: nextTitle,
+            summaryHistoryId: null,
+            summaryReport: null,
+            updatedAt: assistantMessage.createdAt,
+            lastMessageAt: assistantMessage.createdAt,
+          },
+          $push: {
+            messages: {
+              $each: [userMessage, assistantMessage],
+            },
+          },
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      res.status(200).json({
+        success: true,
+        provider: "groq",
+        model: groqModel,
+        userMessage: formatAIHealthConversationMessage(userMessage),
+        assistantMessage: formatAIHealthConversationMessage(assistantMessage),
+        conversation: updatedConversation
+          ? formatAIHealthConversation(updatedConversation)
+          : null,
+      });
+    } catch (error) {
+      console.error("AI Health persistent chat error:", error);
+
+      res.status(502).json({
+        success: false,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to receive a response from the AI provider",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Legacy AI Health chat endpoint
 ========================================================= */
 
 app.post(
@@ -4632,51 +5241,40 @@ app.post(
           success: false,
           message: "User account was not found",
         });
-
         return;
       }
 
-      const validation = normalizeAIHealthMessages(req.body.messages);
+      const validation = normalizeAIHealthMessages(req.body.messages, {
+        requireLatestUser: true,
+        maximumMessages: 22,
+        maximumCharacters: 26000,
+      });
 
       if (!validation.success) {
         res.status(400).json({
           success: false,
           message: validation.message,
         });
-
         return;
       }
 
       const emergencyDetected = hasEmergencyWarning(validation.messages);
-      const patientName = getDoctorString(currentUser.name) || "Patient";
-
-      const systemPrompt = `You are SebaSathi AI Health Assistant for a Bangladesh-oriented healthcare platform. The patient is ${patientName}.\n\nYour job is to provide cautious, general health guidance and help the patient decide which type of qualified doctor or specialist may be appropriate.\n\nMandatory safety rules:\n1. Never claim to diagnose a disease.\n2. Never prescribe medicines, antibiotics, controlled drugs, or provide individualized dosage instructions.\n3. Do not tell the patient to stop prescribed treatment.\n4. Ask concise follow-up questions when important information is missing.\n5. When emergency warning signs are present, clearly advise immediate emergency evaluation and do not delay care for more chat.\n6. Match the patient's language. If the patient writes Bangla or Banglish, respond in easy Bangla/Banglish; otherwise respond in clear English.\n7. Suggest specialist categories only when supported by the symptoms. Examples include General Physician/Internal Medicine, Cardiology, Neurology, Dermatology, ENT, Gastroenterology, Gynecology, Pediatrics, Orthopedics, Psychiatry, Ophthalmology, Pulmonology, Urology, Endocrinology, or Emergency Medicine.\n8. Give practical low-risk steps only, such as rest, hydration when appropriate, symptom tracking, and arranging professional care.\n\nReturn ONLY a valid JSON object with exactly these fields:\n{\n  "reply": "empathetic conversational answer",\n  "urgencyLevel": "routine | soon | urgent | emergency",\n  "suggestedSpecialists": ["specialist names"],\n  "recommendedActions": ["safe next steps"],\n  "warningSigns": ["signs that require urgent care"],\n  "followUpQuestions": ["short questions"],\n  "disclaimer": "short medical disclaimer"\n}`;
+      const systemPrompt = `You are SebaSathi AI Health Assistant. Never diagnose or prescribe. Reply in maximum 3 short sentences, then return maximum 2 specialists, 3 actions, 3 warnings and 2 follow-up questions. Match the user's language. Return only JSON with reply, urgencyLevel, suggestedSpecialists, recommendedActions, warningSigns, followUpQuestions and disclaimer.`;
 
       const groqData = await callGroqAI(
-        [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          ...validation.messages,
-        ],
-        0.25,
-      );
-
-      const assistant = formatAIHealthAssistantResponse(
-        groqData,
-        emergencyDetected,
+        [{ role: "system", content: systemPrompt }, ...validation.messages],
+        0.2,
+        650,
       );
 
       res.status(200).json({
         success: true,
         provider: "groq",
         model: groqModel,
-        assistant,
+        assistant: formatAIHealthAssistantResponse(groqData, emergencyDetected),
       });
     } catch (error) {
       console.error("AI Health chat error:", error);
-
       res.status(502).json({
         success: false,
         message:
@@ -4704,7 +5302,6 @@ app.post(
           success: false,
           message: "Database is not connected",
         });
-
         return;
       }
 
@@ -4715,22 +5312,73 @@ app.post(
           success: false,
           message: "User account was not found",
         });
-
         return;
       }
 
-      const validation = normalizeAIHealthMessages(req.body.messages);
+      const userId = getDoctorDocumentId(currentUser);
+      const conversationId = getDoctorString(req.body.conversationId);
+      let conversation: Document | null = null;
+      let conversationTitle = "AI Health Conversation";
+      let messagesValue: unknown = req.body.messages;
+
+      if (conversationId) {
+        conversation = await getAIHealthConversationForUser(
+          userId,
+          conversationId,
+        );
+
+        if (!conversation) {
+          res.status(404).json({
+            success: false,
+            message: "AI health conversation was not found",
+          });
+          return;
+        }
+
+        conversationTitle =
+          getDoctorString(conversation.title) || "AI Health Conversation";
+        messagesValue = getStoredAIHealthMessages(conversation.messages).map(
+          ({ role, content }) => ({ role, content }),
+        );
+      }
+
+      /*
+       * Summary validation intentionally allows the final message
+       * to be from the assistant. This fixes the previous 400 error
+       * after a normal completed user/assistant exchange.
+       */
+      const validation = normalizeAIHealthMessages(messagesValue, {
+        requireLatestUser: false,
+        maximumMessages: 40,
+        maximumCharacters: 42000,
+      });
 
       if (!validation.success) {
         res.status(400).json({
           success: false,
           message: validation.message,
         });
-
         return;
       }
 
-      const systemPrompt = `You generate a concise structured health-conversation report for SebaSathi AI. Summarize only information actually present in the conversation. Do not invent symptoms, duration, test results, diagnoses or medicines. Do not diagnose or prescribe. Match the language used by the user when practical.\n\nReturn ONLY a valid JSON object with exactly these fields:\n{\n  "reportTitle": "short report title",\n  "conciseSummary": "2-4 sentence summary",\n  "chiefConcerns": ["main concerns"],\n  "symptoms": ["reported symptoms"],\n  "durationAndPattern": "duration, onset and pattern, or Not clearly stated",\n  "severity": "reported severity or Not clearly stated",\n  "urgencyLevel": "routine | soon | urgent | emergency",\n  "redFlags": ["reported or potential warning signs"],\n  "suggestedSpecialists": ["relevant specialist categories"],\n  "selfCareGuidance": ["low-risk general guidance only"],\n  "questionsForDoctor": ["useful questions or information to discuss"],\n  "emergencyAdvice": "clear emergency advice when applicable",\n  "disclaimer": "not a diagnosis or prescription"\n}`;
+      const systemPrompt = `Generate a concise structured health-conversation report for SebaSathi AI. Use only information actually present. Do not invent symptoms, duration, tests, diagnoses or medicines. Do not diagnose or prescribe. Match the user's language where practical.
+
+Return ONLY valid JSON:
+{
+  "reportTitle": "short title",
+  "conciseSummary": "2-3 concise sentences",
+  "chiefConcerns": ["main concerns"],
+  "symptoms": ["reported symptoms"],
+  "durationAndPattern": "stated duration/pattern or Not clearly stated",
+  "severity": "stated severity or Not clearly stated",
+  "urgencyLevel": "routine | soon | urgent | emergency",
+  "redFlags": ["warning signs"],
+  "suggestedSpecialists": ["specialist categories"],
+  "selfCareGuidance": ["low-risk general guidance"],
+  "questionsForDoctor": ["useful questions"],
+  "emergencyAdvice": "brief emergency advice",
+  "disclaimer": "not a diagnosis or prescription"
+}`;
 
       const groqData = await callGroqAI(
         [
@@ -4744,29 +5392,31 @@ app.post(
           },
         ],
         0.1,
+        1100,
       );
 
       const report = formatAIHealthSummary(groqData);
       const now = new Date();
-      const userId = getDoctorDocumentId(currentUser);
       const userRole = getNormalizedUserRole(currentUser);
       const userName = getDoctorString(currentUser.name);
       const userEmail = normalizeDoctorEmail(currentUser.email);
       const userImage = getDoctorString(currentUser.image) || null;
+      const historyCollection = database.collection(
+        AI_HEALTH_HISTORY_COLLECTION,
+      );
 
       const historyDocument = {
+        conversationId: conversation ? getDoctorDocumentId(conversation) : null,
+        conversationTitle,
         userId,
         userRole,
         userName,
         userEmail,
         userImage,
-
-        // Backward-compatible fields.
         patientUserId: userId,
         patientName: userName,
         patientEmail: userEmail,
         patientImage: userImage,
-
         provider: "groq",
         model: groqModel,
         report,
@@ -4775,24 +5425,68 @@ app.post(
         updatedAt: now,
       };
 
-      const historyCollection = database.collection(
-        AI_HEALTH_HISTORY_COLLECTION,
-      );
+      let history: Document | null = null;
+      const existingSummaryId = getDoctorString(conversation?.summaryHistoryId);
 
-      const insertResult = await historyCollection.insertOne(historyDocument);
-      const createdHistory = await historyCollection.findOne({
-        _id: insertResult.insertedId,
-      });
+      if (existingSummaryId) {
+        const existingHistory = await historyCollection.findOne({
+          $and: [
+            getDoctorFilter(existingSummaryId),
+            getAIHealthOwnerFilter(userId),
+          ],
+        });
+
+        if (existingHistory) {
+          history = await historyCollection.findOneAndUpdate(
+            { _id: existingHistory._id },
+            {
+              $set: {
+                ...historyDocument,
+                createdAt: existingHistory.createdAt || now,
+                updatedAt: now,
+              },
+            },
+            { returnDocument: "after" },
+          );
+        }
+      }
+
+      if (!history) {
+        const insertResult = await historyCollection.insertOne(historyDocument);
+        history = await historyCollection.findOne({
+          _id: insertResult.insertedId,
+        });
+      }
+
+      if (!history) {
+        throw new Error("The generated summary could not be saved");
+      }
+
+      if (conversation) {
+        await database.collection(AI_HEALTH_CHAT_COLLECTION).updateOne(
+          { _id: conversation._id },
+          {
+            $set: {
+              summaryHistoryId: getDoctorDocumentId(history),
+              summaryReport: report,
+              updatedAt: now,
+            },
+          },
+        );
+      }
 
       res.status(201).json({
         success: true,
         message: "AI health summary generated and saved successfully",
-        history: createdHistory
-          ? formatAIHealthHistory(createdHistory)
-          : {
-              id: insertResult.insertedId.toHexString(),
-              ...historyDocument,
-            },
+        history: formatAIHealthHistory(history),
+        conversation: conversation
+          ? formatAIHealthConversation({
+              ...conversation,
+              summaryHistoryId: getDoctorDocumentId(history),
+              summaryReport: report,
+              updatedAt: now,
+            })
+          : null,
       });
     } catch (error) {
       console.error("AI Health summary error:", error);
@@ -4809,7 +5503,7 @@ app.post(
 );
 
 /* =========================================================
-   User AI Health history (ready for dashboard later)
+   Saved AI Health summary history
 ========================================================= */
 
 app.get(
@@ -4823,7 +5517,6 @@ app.get(
           success: false,
           message: "Database is not connected",
         });
-
         return;
       }
 
@@ -4834,7 +5527,6 @@ app.get(
           success: false,
           message: "User account was not found",
         });
-
         return;
       }
 
@@ -4842,24 +5534,12 @@ app.get(
       const page = getPositiveInteger(req.query.page, 1, 100000);
       const limit = 10;
       const collection = database.collection(AI_HEALTH_HISTORY_COLLECTION);
-      const filter: Filter<Document> = {
-        $or: [
-          {
-            userId,
-          },
-          {
-            patientUserId: userId,
-          },
-        ],
-      };
+      const filter = getAIHealthOwnerFilter(userId);
 
       const [documents, total] = await Promise.all([
         collection
           .find(filter)
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
+          .sort({ createdAt: -1, _id: -1 })
           .skip((page - 1) * limit)
           .limit(limit)
           .toArray(),
@@ -4878,7 +5558,6 @@ app.get(
       });
     } catch (error) {
       console.error("Get AI Health history error:", error);
-
       res.status(500).json({
         success: false,
         message: "Failed to retrieve AI health history",
@@ -4898,7 +5577,6 @@ app.get(
           success: false,
           message: "Database is not connected",
         });
-
         return;
       }
 
@@ -4909,29 +5587,15 @@ app.get(
           success: false,
           message: "User account was not found",
         });
-
         return;
       }
 
       const userId = getDoctorDocumentId(currentUser);
       const historyId = getDoctorString(req.params.historyId);
-
       const history = await database
         .collection(AI_HEALTH_HISTORY_COLLECTION)
         .findOne({
-          $and: [
-            getDoctorFilter(historyId),
-            {
-              $or: [
-                {
-                  userId,
-                },
-                {
-                  patientUserId: userId,
-                },
-              ],
-            },
-          ],
+          $and: [getDoctorFilter(historyId), getAIHealthOwnerFilter(userId)],
         });
 
       if (!history) {
@@ -4939,7 +5603,6 @@ app.get(
           success: false,
           message: "AI health history was not found",
         });
-
         return;
       }
 
@@ -4949,7 +5612,6 @@ app.get(
       });
     } catch (error) {
       console.error("Get AI Health history details error:", error);
-
       res.status(500).json({
         success: false,
         message: "Failed to retrieve AI health history details",
@@ -5027,6 +5689,12 @@ const connectDatabase = async (): Promise<void> => {
     database
       .collection(AI_HEALTH_HISTORY_COLLECTION)
       .createIndex({ patientUserId: 1, createdAt: -1 }),
+    database
+      .collection(AI_HEALTH_CHAT_COLLECTION)
+      .createIndex({ userId: 1, lastMessageAt: -1 }),
+    database
+      .collection(AI_HEALTH_CHAT_COLLECTION)
+      .createIndex({ patientUserId: 1, lastMessageAt: -1 }),
   ]);
 
   console.log(`MongoDB connected successfully. Database: ${mongoDbName}`);
