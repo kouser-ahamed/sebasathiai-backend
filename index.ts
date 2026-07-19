@@ -615,7 +615,8 @@ const formatDoctor = (doctor: Document) => {
 
     experienceYears: getDoctorNumber(doctor.experienceYears),
 
-    hospital: getDoctorString(doctor.hospital),
+    hospital:
+      getDoctorString(doctor.hospital) || getDoctorString(doctor.chamber),
 
     address: getDoctorString(doctor.address),
 
@@ -1457,6 +1458,1614 @@ app.delete(
 );
 
 /* =========================================================
+   Public doctors, appointments and reviews
+========================================================= */
+
+type AppointmentStatus = "pending" | "approved" | "completed" | "rejected";
+
+const ACTIVE_APPOINTMENT_STATUSES: AppointmentStatus[] = [
+  "pending",
+  "approved",
+];
+
+const getPositiveInteger = (
+  value: unknown,
+  fallback: number,
+  maximum: number,
+): number => {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(maximum, Math.max(1, Math.floor(parsed)));
+};
+
+const getCurrentDatabaseUser = async (
+  req: AuthenticatedRequest,
+): Promise<Document | null> => {
+  if (!database || !req.userId) {
+    return null;
+  }
+
+  const conditions: Filter<Document>[] = [getUserFilter(req.userId)];
+
+  if (req.userEmail) {
+    conditions.push({
+      email: req.userEmail.toLowerCase(),
+    });
+  }
+
+  return database.collection("user").findOne({
+    $or: conditions,
+  });
+};
+
+const getNormalizedUserRole = (user: Document): UserRole => {
+  return user.role === "admin" ||
+    user.role === "doctor" ||
+    user.role === "patient"
+    ? user.role
+    : "patient";
+};
+
+const getNormalizedUserStatus = (user: Document): UserStatus => {
+  return user.status === "blocked" ? "blocked" : "active";
+};
+
+const getPublicDoctor = (doctor: Document) => {
+  const ratingAverage = Number(doctor.ratingAverage);
+
+  const ratingCount = Number(doctor.ratingCount);
+
+  return {
+    ...formatDoctor(doctor),
+
+    ratingAverage: Number.isFinite(ratingAverage)
+      ? Number(ratingAverage.toFixed(1))
+      : 0,
+
+    ratingCount: Number.isFinite(ratingCount)
+      ? Math.max(0, Math.floor(ratingCount))
+      : 0,
+  };
+};
+
+const getReviewDocumentId = (document: Document): string => {
+  return getDoctorDocumentId(document);
+};
+
+const formatReview = (review: Document) => {
+  return {
+    id: getReviewDocumentId(review),
+    doctorId: getDoctorString(review.doctorId),
+    userId: getDoctorString(review.userId),
+    userName: getDoctorString(review.userName),
+    userEmail: normalizeDoctorEmail(review.userEmail),
+    userImage: getDoctorString(review.userImage) || null,
+    rating: Math.min(
+      5,
+      Math.max(1, Math.floor(getDoctorNumber(review.rating))),
+    ),
+    review: getDoctorString(review.review),
+    createdAt: formatDoctorDate(review.createdAt),
+    updatedAt: formatDoctorDate(review.updatedAt),
+  };
+};
+
+const refreshDoctorRatingStats = async (doctorId: string): Promise<void> => {
+  if (!database) {
+    return;
+  }
+
+  const reviewsCollection = database.collection("reviews");
+
+  const doctorsCollection = database.collection("doctors");
+
+  const [stats] = await reviewsCollection
+    .aggregate([
+      {
+        $match: {
+          doctorId,
+        },
+      },
+      {
+        $group: {
+          _id: "$doctorId",
+          ratingAverage: {
+            $avg: "$rating",
+          },
+          ratingCount: {
+            $sum: 1,
+          },
+        },
+      },
+    ])
+    .toArray();
+
+  await doctorsCollection.updateOne(getDoctorFilter(doctorId), {
+    $set: {
+      ratingAverage:
+        typeof stats?.ratingAverage === "number"
+          ? Number(stats.ratingAverage.toFixed(2))
+          : 0,
+      ratingCount:
+        typeof stats?.ratingCount === "number" ? stats.ratingCount : 0,
+      updatedAt: new Date(),
+    },
+  });
+};
+
+const formatAppointment = (appointment: Document) => {
+  return {
+    id: getDoctorDocumentId(appointment),
+    doctorId: getDoctorString(appointment.doctorId),
+    doctorUserId: getDoctorString(appointment.doctorUserId),
+    doctorName: getDoctorString(appointment.doctorName),
+    doctorImage: getDoctorString(appointment.doctorImage) || null,
+    specialization: getDoctorString(appointment.specialization),
+    hospital: getDoctorString(appointment.hospital),
+    patientUserId: getDoctorString(appointment.patientUserId),
+    patientName: getDoctorString(appointment.patientName),
+    patientEmail: normalizeDoctorEmail(appointment.patientEmail),
+    phone: getDoctorString(appointment.phone),
+    address: getDoctorString(appointment.address),
+    problemTitle: getDoctorString(appointment.problemTitle),
+    symptomsDescription: getDoctorString(appointment.symptomsDescription),
+    appointmentDate: getDoctorString(appointment.appointmentDate),
+    appointmentTime: getDoctorString(appointment.appointmentTime),
+    status:
+      appointment.status === "approved" ||
+      appointment.status === "completed" ||
+      appointment.status === "rejected"
+        ? appointment.status
+        : "pending",
+    createdAt: formatDoctorDate(appointment.createdAt),
+    updatedAt: formatDoctorDate(appointment.updatedAt),
+  };
+};
+
+/* =========================================================
+   Public doctor filters
+========================================================= */
+
+app.get(
+  "/api/v1/doctors/filters",
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const doctorDocuments = await database
+        .collection("doctors")
+        .find(
+          {
+            status: "active",
+          },
+          {
+            projection: {
+              specialization: 1,
+              qualification: 1,
+              experienceYears: 1,
+              hospital: 1,
+              chamber: 1,
+            },
+          },
+        )
+        .toArray();
+
+      const specializations = new Set<string>();
+      const qualifications = new Set<string>();
+      const hospitals = new Set<string>();
+      const experienceYears = new Set<number>();
+
+      doctorDocuments.forEach((doctor) => {
+        const specialization = getDoctorString(doctor.specialization);
+        const qualification = getDoctorString(doctor.qualification);
+        const hospital =
+          getDoctorString(doctor.hospital) || getDoctorString(doctor.chamber);
+        const experience = getDoctorNumber(doctor.experienceYears);
+
+        if (specialization) {
+          specializations.add(specialization);
+        }
+
+        if (qualification) {
+          qualifications.add(qualification);
+        }
+
+        if (hospital) {
+          hospitals.add(hospital);
+        }
+
+        experienceYears.add(experience);
+      });
+
+      res.status(200).json({
+        success: true,
+        filters: {
+          specializations: Array.from(specializations).sort((a, b) =>
+            a.localeCompare(b),
+          ),
+          qualifications: Array.from(qualifications).sort((a, b) =>
+            a.localeCompare(b),
+          ),
+          hospitals: Array.from(hospitals).sort((a, b) => a.localeCompare(b)),
+          experienceYears: Array.from(experienceYears).sort((a, b) => a - b),
+        },
+      });
+    } catch (error) {
+      console.error("Get public doctor filters error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve doctor filters",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Public doctor list
+========================================================= */
+
+app.get(
+  "/api/v1/doctors",
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const search = getDoctorString(req.query.search);
+      const specialization = getDoctorString(req.query.specialization);
+      const qualification = getDoctorString(req.query.qualification);
+      const hospital = getDoctorString(req.query.hospital);
+      const experienceValue = getDoctorString(req.query.experienceYears);
+
+      const page = getPositiveInteger(req.query.page, 1, 100000);
+
+      const limit = 8;
+
+      const conditions: Filter<Document>[] = [
+        {
+          status: "active",
+        },
+      ];
+
+      if (search) {
+        const safeSearch = escapeDoctorSearch(search);
+
+        conditions.push({
+          $or: [
+            {
+              name: {
+                $regex: safeSearch,
+                $options: "i",
+              },
+            },
+            {
+              specialization: {
+                $regex: safeSearch,
+                $options: "i",
+              },
+            },
+            {
+              qualification: {
+                $regex: safeSearch,
+                $options: "i",
+              },
+            },
+          ],
+        });
+      }
+
+      if (specialization) {
+        conditions.push({
+          specialization: {
+            $regex: `^${escapeDoctorSearch(specialization)}$`,
+            $options: "i",
+          },
+        });
+      }
+
+      if (qualification) {
+        conditions.push({
+          qualification: {
+            $regex: `^${escapeDoctorSearch(qualification)}$`,
+            $options: "i",
+          },
+        });
+      }
+
+      if (hospital) {
+        const safeHospital = `^${escapeDoctorSearch(hospital)}$`;
+
+        conditions.push({
+          $or: [
+            {
+              hospital: {
+                $regex: safeHospital,
+                $options: "i",
+              },
+            },
+            {
+              chamber: {
+                $regex: safeHospital,
+                $options: "i",
+              },
+            },
+          ],
+        });
+      }
+
+      if (experienceValue) {
+        const experienceYears = Number(experienceValue);
+
+        if (Number.isFinite(experienceYears)) {
+          conditions.push({
+            experienceYears: Math.max(0, Math.floor(experienceYears)),
+          });
+        }
+      }
+
+      const filter: Filter<Document> = {
+        $and: conditions,
+      };
+
+      const doctorsCollection = database.collection("doctors");
+
+      const [doctorDocuments, total] = await Promise.all([
+        doctorsCollection
+          .find(filter)
+          .sort({
+            ratingAverage: -1,
+            ratingCount: -1,
+            createdAt: -1,
+            _id: -1,
+          })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        doctorsCollection.countDocuments(filter),
+      ]);
+
+      res.status(200).json({
+        success: true,
+        doctors: doctorDocuments.map(getPublicDoctor),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
+      });
+    } catch (error) {
+      console.error("Get public doctors error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve public doctors",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Public single doctor details
+========================================================= */
+
+app.get(
+  "/api/v1/doctors/:doctorId",
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+
+      const doctor = await database.collection("doctors").findOne({
+        $and: [
+          getDoctorFilter(doctorId),
+          {
+            status: "active",
+          },
+        ],
+      });
+
+      if (!doctor) {
+        res.status(404).json({
+          success: false,
+          message: "Doctor was not found",
+        });
+
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        doctor: getPublicDoctor(doctor),
+      });
+    } catch (error) {
+      console.error("Get public doctor details error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve doctor details",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Public doctor reviews
+========================================================= */
+
+app.get(
+  "/api/v1/doctors/:doctorId/reviews",
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+      const page = getPositiveInteger(req.query.page, 1, 100000);
+      const limit = getPositiveInteger(req.query.limit, 10, 50);
+
+      const reviewsCollection = database.collection("reviews");
+
+      const [reviewDocuments, total] = await Promise.all([
+        reviewsCollection
+          .find({
+            doctorId,
+          })
+          .sort({
+            updatedAt: -1,
+            createdAt: -1,
+          })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        reviewsCollection.countDocuments({
+          doctorId,
+        }),
+      ]);
+
+      res.status(200).json({
+        success: true,
+        reviews: reviewDocuments.map(formatReview),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
+      });
+    } catch (error) {
+      console.error("Get doctor reviews error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve doctor reviews",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Create doctor review
+========================================================= */
+
+app.post(
+  "/api/v1/doctors/:doctorId/reviews",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      if (getNormalizedUserStatus(currentUser) === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "You are restricted by the administrator and cannot submit a rating or review.",
+          code: "ACCOUNT_BLOCKED",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+      const rating = Math.floor(Number(req.body.rating));
+      const reviewText = getDoctorString(req.body.review);
+
+      if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+        res.status(400).json({
+          success: false,
+          message: "Rating must be a number from 1 to 5",
+        });
+
+        return;
+      }
+
+      if (reviewText.length > 2000) {
+        res.status(400).json({
+          success: false,
+          message: "Review cannot contain more than 2000 characters",
+        });
+
+        return;
+      }
+
+      const doctor = await database.collection("doctors").findOne({
+        $and: [
+          getDoctorFilter(doctorId),
+          {
+            status: "active",
+          },
+        ],
+      });
+
+      if (!doctor) {
+        res.status(404).json({
+          success: false,
+          message: "Doctor was not found",
+        });
+
+        return;
+      }
+
+      const currentUserId = getDoctorDocumentId(currentUser);
+
+      if (getDoctorString(doctor.userId) === currentUserId) {
+        res.status(403).json({
+          success: false,
+          message: "A doctor cannot review their own profile",
+        });
+
+        return;
+      }
+
+      const reviewsCollection = database.collection("reviews");
+
+      const existingReview = await reviewsCollection.findOne({
+        doctorId,
+        userId: currentUserId,
+      });
+
+      if (existingReview) {
+        res.status(409).json({
+          success: false,
+          message:
+            "You have already reviewed this doctor. Please edit your existing review.",
+          code: "REVIEW_ALREADY_EXISTS",
+        });
+
+        return;
+      }
+
+      const now = new Date();
+
+      const reviewDocument = {
+        doctorId,
+        doctorUserId: getDoctorString(doctor.userId),
+        userId: currentUserId,
+        userName: getDoctorString(currentUser.name),
+        userEmail: normalizeDoctorEmail(currentUser.email),
+        userImage: getDoctorString(currentUser.image) || null,
+        rating,
+        review: reviewText,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const insertResult = await reviewsCollection.insertOne(reviewDocument);
+
+      await refreshDoctorRatingStats(doctorId);
+
+      const createdReview = await reviewsCollection.findOne({
+        _id: insertResult.insertedId,
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "Rating and review submitted successfully",
+        review: createdReview ? formatReview(createdReview) : null,
+      });
+    } catch (error) {
+      console.error("Create doctor review error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to submit rating and review",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Update doctor review
+========================================================= */
+
+app.patch(
+  "/api/v1/doctors/:doctorId/reviews/:reviewId",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      if (getNormalizedUserStatus(currentUser) === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "You are restricted by the administrator and cannot edit a review.",
+          code: "ACCOUNT_BLOCKED",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+      const reviewId = getDoctorString(req.params.reviewId);
+      const rating = Math.floor(Number(req.body.rating));
+      const reviewText = getDoctorString(req.body.review);
+
+      if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+        res.status(400).json({
+          success: false,
+          message: "Rating must be a number from 1 to 5",
+        });
+
+        return;
+      }
+
+      if (reviewText.length > 2000) {
+        res.status(400).json({
+          success: false,
+          message: "Review cannot contain more than 2000 characters",
+        });
+
+        return;
+      }
+
+      const reviewsCollection = database.collection("reviews");
+
+      const existingReview = await reviewsCollection.findOne({
+        $and: [
+          getDoctorFilter(reviewId),
+          {
+            doctorId,
+          },
+        ],
+      });
+
+      if (!existingReview) {
+        res.status(404).json({
+          success: false,
+          message: "Review was not found",
+        });
+
+        return;
+      }
+
+      const currentUserId = getDoctorDocumentId(currentUser);
+
+      if (getDoctorString(existingReview.userId) !== currentUserId) {
+        res.status(403).json({
+          success: false,
+          message: "You can edit only your own review",
+        });
+
+        return;
+      }
+
+      const updatedReview = await reviewsCollection.findOneAndUpdate(
+        {
+          _id: existingReview._id,
+        },
+        {
+          $set: {
+            rating,
+            review: reviewText,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      await refreshDoctorRatingStats(doctorId);
+
+      res.status(200).json({
+        success: true,
+        message: "Rating and review updated successfully",
+        review: updatedReview ? formatReview(updatedReview) : null,
+      });
+    } catch (error) {
+      console.error("Update doctor review error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to update rating and review",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Delete doctor review
+========================================================= */
+
+app.delete(
+  "/api/v1/doctors/:doctorId/reviews/:reviewId",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      if (getNormalizedUserStatus(currentUser) === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "You are restricted by the administrator and cannot delete a review.",
+          code: "ACCOUNT_BLOCKED",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+      const reviewId = getDoctorString(req.params.reviewId);
+
+      const reviewsCollection = database.collection("reviews");
+
+      const existingReview = await reviewsCollection.findOne({
+        $and: [
+          getDoctorFilter(reviewId),
+          {
+            doctorId,
+          },
+        ],
+      });
+
+      if (!existingReview) {
+        res.status(404).json({
+          success: false,
+          message: "Review was not found",
+        });
+
+        return;
+      }
+
+      const currentUserId = getDoctorDocumentId(currentUser);
+
+      if (getDoctorString(existingReview.userId) !== currentUserId) {
+        res.status(403).json({
+          success: false,
+          message: "You can delete only your own review",
+        });
+
+        return;
+      }
+
+      await reviewsCollection.deleteOne({
+        _id: existingReview._id,
+      });
+
+      await refreshDoctorRatingStats(doctorId);
+
+      res.status(200).json({
+        success: true,
+        message: "Review deleted successfully",
+        deletedReviewId: reviewId,
+      });
+    } catch (error) {
+      console.error("Delete doctor review error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete review",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Appointment eligibility
+========================================================= */
+
+app.get(
+  "/api/v1/appointments/eligibility/:doctorId",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const role = getNormalizedUserRole(currentUser);
+      const status = getNormalizedUserStatus(currentUser);
+
+      if (role !== "patient") {
+        res.status(403).json({
+          success: false,
+          canBook: false,
+          code: "PATIENT_ONLY",
+          message: "Only patients can take a doctor appointment.",
+        });
+
+        return;
+      }
+
+      if (status === "blocked") {
+        res.status(403).json({
+          success: false,
+          canBook: false,
+          code: "ACCOUNT_BLOCKED",
+          message:
+            "You are restricted by the administrator and cannot take an appointment.",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.params.doctorId);
+
+      const doctor = await database.collection("doctors").findOne({
+        $and: [
+          getDoctorFilter(doctorId),
+          {
+            status: "active",
+          },
+        ],
+      });
+
+      if (!doctor) {
+        res.status(404).json({
+          success: false,
+          canBook: false,
+          message: "Doctor was not found",
+        });
+
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+
+      const existingAppointment = await database
+        .collection("appointments")
+        .findOne({
+          doctorId,
+          patientUserId,
+          status: {
+            $in: ACTIVE_APPOINTMENT_STATUSES,
+          },
+        });
+
+      if (existingAppointment) {
+        res.status(200).json({
+          success: true,
+          canBook: false,
+          code: "APPOINTMENT_ALREADY_EXISTS",
+          message:
+            "You already have a pending or approved appointment with this doctor.",
+          appointment: formatAppointment(existingAppointment),
+        });
+
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        canBook: true,
+        message: "You can take an appointment with this doctor.",
+      });
+    } catch (error) {
+      console.error("Appointment eligibility error:", error);
+
+      res.status(500).json({
+        success: false,
+        canBook: false,
+        message: "Failed to check appointment eligibility",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Create appointment
+========================================================= */
+
+app.post(
+  "/api/v1/appointments",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const role = getNormalizedUserRole(currentUser);
+      const status = getNormalizedUserStatus(currentUser);
+
+      if (role !== "patient") {
+        res.status(403).json({
+          success: false,
+          message: "Only patients can take a doctor appointment.",
+          code: "PATIENT_ONLY",
+        });
+
+        return;
+      }
+
+      if (status === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "You are restricted by the administrator and cannot take an appointment.",
+          code: "ACCOUNT_BLOCKED",
+        });
+
+        return;
+      }
+
+      const doctorId = getDoctorString(req.body.doctorId);
+      const patientName = getDoctorString(req.body.patientName);
+      const phone = getDoctorString(req.body.phone);
+      const address = getDoctorString(req.body.address);
+      const problemTitle = getDoctorString(req.body.problemTitle);
+      const symptomsDescription = getDoctorString(req.body.symptomsDescription);
+      const appointmentDate = getDoctorString(req.body.appointmentDate);
+      const appointmentTime = getDoctorString(req.body.appointmentTime);
+
+      if (
+        !doctorId ||
+        !patientName ||
+        !phone ||
+        !address ||
+        !problemTitle ||
+        !symptomsDescription ||
+        !appointmentDate ||
+        !appointmentTime
+      ) {
+        res.status(400).json({
+          success: false,
+          message:
+            "Patient name, phone, address, health problem title, symptoms description, appointment date and time are required.",
+        });
+
+        return;
+      }
+
+      if (symptomsDescription.length > 5000) {
+        res.status(400).json({
+          success: false,
+          message:
+            "Symptoms description cannot contain more than 5000 characters",
+        });
+
+        return;
+      }
+
+      const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+      const timePattern = /^\d{2}:\d{2}$/;
+
+      if (
+        !datePattern.test(appointmentDate) ||
+        !timePattern.test(appointmentTime)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "A valid appointment date and time are required",
+        });
+
+        return;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      if (appointmentDate < today) {
+        res.status(400).json({
+          success: false,
+          message: "Appointment date cannot be in the past",
+        });
+
+        return;
+      }
+
+      const doctor = await database.collection("doctors").findOne({
+        $and: [
+          getDoctorFilter(doctorId),
+          {
+            status: "active",
+          },
+        ],
+      });
+
+      if (!doctor) {
+        res.status(404).json({
+          success: false,
+          message: "Doctor was not found",
+        });
+
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const appointmentsCollection = database.collection("appointments");
+
+      const existingAppointment = await appointmentsCollection.findOne({
+        doctorId,
+        patientUserId,
+        status: {
+          $in: ACTIVE_APPOINTMENT_STATUSES,
+        },
+      });
+
+      if (existingAppointment) {
+        res.status(409).json({
+          success: false,
+          message:
+            "You already have a pending or approved appointment with this doctor.",
+          code: "APPOINTMENT_ALREADY_EXISTS",
+          appointment: formatAppointment(existingAppointment),
+        });
+
+        return;
+      }
+
+      const now = new Date();
+
+      const appointmentDocument = {
+        doctorId,
+        doctorUserId: getDoctorString(doctor.userId),
+        doctorName: getDoctorString(doctor.name),
+        doctorImage: getDoctorString(doctor.image) || null,
+        specialization: getDoctorString(doctor.specialization),
+        hospital:
+          getDoctorString(doctor.hospital) || getDoctorString(doctor.chamber),
+        patientUserId,
+        patientName,
+        patientEmail: normalizeDoctorEmail(currentUser.email),
+        phone,
+        address,
+        problemTitle,
+        symptomsDescription,
+        appointmentDate,
+        appointmentTime,
+        status: "pending" as const,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const insertResult =
+        await appointmentsCollection.insertOne(appointmentDocument);
+
+      const createdAppointment = await appointmentsCollection.findOne({
+        _id: insertResult.insertedId,
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "Appointment request submitted successfully",
+        appointment: createdAppointment
+          ? formatAppointment(createdAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Create appointment error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to submit appointment request",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Patient appointments
+========================================================= */
+
+app.get(
+  "/api/v1/patient/appointments",
+  verifyToken,
+  verifyPatient,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+
+      const appointments = await database
+        .collection("appointments")
+        .find({
+          patientUserId,
+        })
+        .sort({
+          createdAt: -1,
+        })
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        appointments: appointments.map(formatAppointment),
+      });
+    } catch (error) {
+      console.error("Get patient appointments error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve appointments",
+      });
+    }
+  },
+);
+
+const getAppointmentListFilter = (
+  req: AuthenticatedRequest,
+): Filter<Document> => {
+  const conditions: Filter<Document>[] = [];
+  const status = getDoctorString(req.query.status);
+  const search = getDoctorString(req.query.search);
+
+  if (
+    status === "pending" ||
+    status === "approved" ||
+    status === "completed" ||
+    status === "rejected"
+  ) {
+    conditions.push({
+      status,
+    });
+  }
+
+  if (search) {
+    const safeSearch = escapeDoctorSearch(search);
+
+    conditions.push({
+      $or: [
+        {
+          patientName: {
+            $regex: safeSearch,
+            $options: "i",
+          },
+        },
+        {
+          patientEmail: {
+            $regex: safeSearch,
+            $options: "i",
+          },
+        },
+        {
+          doctorName: {
+            $regex: safeSearch,
+            $options: "i",
+          },
+        },
+        {
+          problemTitle: {
+            $regex: safeSearch,
+            $options: "i",
+          },
+        },
+      ],
+    });
+  }
+
+  return conditions.length
+    ? {
+        $and: conditions,
+      }
+    : {};
+};
+
+const sendAppointmentList = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  additionalFilter: Filter<Document> = {},
+): Promise<void> => {
+  if (!database) {
+    res.status(503).json({
+      success: false,
+      message: "Database is not connected",
+    });
+
+    return;
+  }
+
+  const page = getPositiveInteger(req.query.page, 1, 100000);
+  const limit = getPositiveInteger(req.query.limit, 20, 100);
+
+  const queryFilter = getAppointmentListFilter(req);
+
+  const filter: Filter<Document> = {
+    $and: [queryFilter, additionalFilter],
+  };
+
+  const appointmentsCollection = database.collection("appointments");
+
+  const [appointmentDocuments, total] = await Promise.all([
+    appointmentsCollection
+      .find(filter)
+      .sort({
+        appointmentDate: 1,
+        appointmentTime: 1,
+        createdAt: -1,
+      })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    appointmentsCollection.countDocuments(filter),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    appointments: appointmentDocuments.map(formatAppointment),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  });
+};
+
+/* =========================================================
+   Admin appointment management
+========================================================= */
+
+app.get(
+  "/api/v1/admin/appointments",
+  verifyToken,
+  verifyAdmin,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      await sendAppointmentList(req, res);
+    } catch (error) {
+      console.error("Get admin appointments error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve appointments",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Doctor appointment management
+========================================================= */
+
+app.get(
+  "/api/v1/doctor/appointments",
+  verifyToken,
+  verifyDoctor,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const doctorUserId = getDoctorDocumentId(currentUser);
+
+      await sendAppointmentList(req, res, {
+        doctorUserId,
+      });
+    } catch (error) {
+      console.error("Get doctor appointments error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve appointments",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Admin or doctor appointment status update
+========================================================= */
+
+app.patch(
+  "/api/v1/appointments/:appointmentId/status",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+
+        return;
+      }
+
+      const role = getNormalizedUserRole(currentUser);
+      const userStatus = getNormalizedUserStatus(currentUser);
+
+      if (role !== "admin" && role !== "doctor") {
+        res.status(403).json({
+          success: false,
+          message:
+            "Only an administrator or doctor can update appointment status.",
+        });
+
+        return;
+      }
+
+      if (userStatus === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "Your account is blocked. You can view appointments but cannot update them.",
+          code: "READ_ONLY_ACCOUNT",
+        });
+
+        return;
+      }
+
+      const requestedStatus = getDoctorString(req.body.status);
+
+      if (
+        requestedStatus !== "approved" &&
+        requestedStatus !== "completed" &&
+        requestedStatus !== "rejected"
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "Status must be approved, completed or rejected",
+        });
+
+        return;
+      }
+
+      const appointmentId = getDoctorString(req.params.appointmentId);
+      const appointmentsCollection = database.collection("appointments");
+
+      const appointment = await appointmentsCollection.findOne(
+        getDoctorFilter(appointmentId),
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+
+        return;
+      }
+
+      if (role === "doctor") {
+        const currentUserId = getDoctorDocumentId(currentUser);
+
+        if (getDoctorString(appointment.doctorUserId) !== currentUserId) {
+          res.status(403).json({
+            success: false,
+            message: "You can update only your own appointments",
+          });
+
+          return;
+        }
+      }
+
+      const currentStatus = getDoctorString(appointment.status);
+
+      if (currentStatus === "completed" || currentStatus === "rejected") {
+        res.status(409).json({
+          success: false,
+          message: "A completed or rejected appointment cannot be changed",
+        });
+
+        return;
+      }
+
+      if (requestedStatus === "completed" && currentStatus !== "approved") {
+        res.status(409).json({
+          success: false,
+          message: "Only an approved appointment can be marked as completed",
+        });
+
+        return;
+      }
+
+      const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
+        {
+          _id: appointment._id,
+        },
+        {
+          $set: {
+            status: requestedStatus as AppointmentStatus,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      res.status(200).json({
+        success: true,
+        message:
+          requestedStatus === "approved"
+            ? "Appointment approved successfully"
+            : requestedStatus === "completed"
+              ? "Consultation completed successfully. The patient can now take another appointment with this doctor."
+              : "Appointment rejected successfully",
+        appointment: updatedAppointment
+          ? formatAppointment(updatedAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Update appointment status error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to update appointment status",
+      });
+    }
+  },
+);
+
+/* =========================================================
    Unknown route handler
 ========================================================= */
 
@@ -1490,6 +3099,30 @@ const connectDatabase = async (): Promise<void> => {
   database = mongoClient.db(mongoDbName);
 
   await database.command({ ping: 1 });
+
+  await Promise.all([
+    database
+      .collection("doctors")
+      .createIndex({ status: 1, ratingAverage: -1, createdAt: -1 }),
+    database.collection("doctors").createIndex({ name: 1 }),
+    database.collection("doctors").createIndex({ specialization: 1 }),
+    database.collection("doctors").createIndex({ qualification: 1 }),
+    database.collection("doctors").createIndex({ hospital: 1 }),
+    database.collection("doctors").createIndex({ experienceYears: 1 }),
+    database
+      .collection("reviews")
+      .createIndex({ doctorId: 1, userId: 1 }, { unique: true }),
+    database.collection("reviews").createIndex({ doctorId: 1, updatedAt: -1 }),
+    database
+      .collection("appointments")
+      .createIndex({ patientUserId: 1, doctorId: 1, status: 1 }),
+    database
+      .collection("appointments")
+      .createIndex({ doctorUserId: 1, status: 1, appointmentDate: 1 }),
+    database
+      .collection("appointments")
+      .createIndex({ status: 1, appointmentDate: 1, appointmentTime: 1 }),
+  ]);
 
   console.log(`MongoDB connected successfully. Database: ${mongoDbName}`);
 };
