@@ -4447,81 +4447,158 @@ const normalizeAIHealthMessages = (
   };
 };
 
-const getAllAIHealthNavigationRoutes = (): AIHealthNavigationRoute[] => [
+const PUBLIC_AI_HEALTH_NAVIGATION_ROUTES: AIHealthNavigationRoute[] = [
   {
-    label: "Find doctors",
+    label: "Home",
+    href: "/",
+    description: "Open the SebaSathi home page.",
+  },
+  {
+    label: "Find Doctors",
     href: "/find-doctors",
     description: "Find active doctors and filter by specialization.",
   },
   {
     label: "AI Health Assistant",
     href: "/ai-health-assistant",
-    description: "Continue using the SebaSathi AI assistant.",
+    description: "Continue using the SebaSathi AI Health Assistant.",
   },
   {
-    label: "My appointments",
-    href: "/dashboard/patient/appointments",
-    description: "View patient appointment requests and their status.",
+    label: "About Us",
+    href: "/about",
+    description: "Learn more about SebaSathi and its healthcare services.",
   },
   {
-    label: "My AI health history",
-    href: "/dashboard/patient/ai-health-history",
-    description: "Review saved AI-generated health summaries.",
+    label: "Contact",
+    href: "/contact",
+    description: "Open the SebaSathi contact page.",
   },
-  {
-    label: "Doctor appointments",
-    href: "/dashboard/doctor/appointments",
-    description: "View appointments assigned to the signed-in doctor.",
-  },
-  {
-    label: "Manage appointments",
-    href: "/dashboard/admin/appointments",
-    description: "Open the administrator appointment management page.",
-  },
-  {
-    label: "Manage doctors",
-    href: "/dashboard/admin/doctors",
-    description: "Open the administrator doctor management page.",
-  },
+];
+
+const ROLE_AI_HEALTH_NAVIGATION_ROUTES: Record<
+  UserRole,
+  AIHealthNavigationRoute[]
+> = {
+  patient: [
+    {
+      label: "Patient Overview",
+      href: "/dashboard/patient",
+      description: "Open the patient's dashboard overview.",
+    },
+    {
+      label: "My Appointments",
+      href: "/dashboard/patient/appointments",
+      description: "View the patient's appointment requests and statuses.",
+    },
+    {
+      label: "Prescriptions",
+      href: "/dashboard/patient/prescriptions",
+      description: "View the patient's saved prescriptions.",
+    },
+    {
+      label: "Consultations",
+      href: "/dashboard/patient/consultations",
+      description: "View the patient's consultation records.",
+    },
+    {
+      label: "AI Health History",
+      href: "/dashboard/patient/ai-health-history",
+      description: "Review saved AI-generated health summaries.",
+    },
+    {
+      label: "My Profile",
+      href: "/dashboard/patient/my-profile",
+      description: "Open the patient's profile settings.",
+    },
+  ],
+  doctor: [
+    {
+      label: "Doctor Overview",
+      href: "/dashboard/doctor",
+      description: "Open the doctor's dashboard overview.",
+    },
+    {
+      label: "Appointments",
+      href: "/dashboard/doctor/patients-appointments",
+      description: "View appointments assigned to the signed-in doctor.",
+    },
+    {
+      label: "My Patients",
+      href: "/dashboard/doctor/patients",
+      description: "View the doctor's patient list.",
+    },
+    {
+      label: "Prescriptions",
+      href: "/dashboard/doctor/prescriptions",
+      description: "Create or review doctor prescription records.",
+    },
+    {
+      label: "Consultation Records",
+      href: "/dashboard/doctor/consultations",
+      description: "View the doctor's consultation records.",
+    },
+    {
+      label: "Availability",
+      href: "/dashboard/doctor/availability",
+      description: "Manage the doctor's availability schedule.",
+    },
+    {
+      label: "My Profile",
+      href: "/dashboard/doctor/my-profile",
+      description: "Open the doctor's profile settings.",
+    },
+  ],
+  admin: [
+    {
+      label: "Admin Overview",
+      href: "/dashboard/admin",
+      description: "Open the administrator dashboard overview.",
+    },
+    {
+      label: "Manage Users",
+      href: "/dashboard/admin/users",
+      description: "Open administrator user management.",
+    },
+    {
+      label: "Manage Doctors",
+      href: "/dashboard/admin/doctors",
+      description: "Open administrator doctor management.",
+    },
+    {
+      label: "Manage Appointments",
+      href: "/dashboard/admin/appointments",
+      description: "Open administrator appointment management.",
+    },
+    {
+      label: "My Profile",
+      href: "/dashboard/admin/my-profile",
+      description: "Open the administrator's profile settings.",
+    },
+  ],
+};
+
+const AI_HEALTH_NAVIGATION_ROUTE_ALIASES: Record<string, string> = {
+  "/doctors": "/find-doctors",
+  "/dashboard/doctor/appointments": "/dashboard/doctor/patients-appointments",
+};
+
+const normalizeAIHealthNavigationHref = (href: string): string => {
+  return AI_HEALTH_NAVIGATION_ROUTE_ALIASES[href] || href;
+};
+
+const getAllAIHealthNavigationRoutes = (): AIHealthNavigationRoute[] => [
+  ...PUBLIC_AI_HEALTH_NAVIGATION_ROUTES,
+  ...ROLE_AI_HEALTH_NAVIGATION_ROUTES.patient,
+  ...ROLE_AI_HEALTH_NAVIGATION_ROUTES.doctor,
+  ...ROLE_AI_HEALTH_NAVIGATION_ROUTES.admin,
 ];
 
 const getAIHealthNavigationRoutes = (
   role: UserRole,
-): AIHealthNavigationRoute[] => {
-  const common = getAllAIHealthNavigationRoutes().filter((route) =>
-    ["/doctors", "/ai-health-assistant"].includes(route.href),
-  );
-
-  if (role === "patient") {
-    return [
-      ...common,
-      ...getAllAIHealthNavigationRoutes().filter((route) =>
-        [
-          "/dashboard/patient/appointments",
-          "/dashboard/patient/ai-health-history",
-        ].includes(route.href),
-      ),
-    ];
-  }
-
-  if (role === "doctor") {
-    return [
-      ...common,
-      ...getAllAIHealthNavigationRoutes().filter(
-        (route) => route.href === "/dashboard/doctor/appointments",
-      ),
-    ];
-  }
-
-  return [
-    ...common,
-    ...getAllAIHealthNavigationRoutes().filter((route) =>
-      ["/dashboard/admin/appointments", "/dashboard/admin/doctors"].includes(
-        route.href,
-      ),
-    ),
-  ];
-};
+): AIHealthNavigationRoute[] => [
+  ...PUBLIC_AI_HEALTH_NAVIGATION_ROUTES,
+  ...ROLE_AI_HEALTH_NAVIGATION_ROUTES[role],
+];
 
 const getAIHealthNavigationActions = (
   value: unknown,
@@ -4543,7 +4620,7 @@ const getAIHealthNavigationActions = (
     }
 
     const action = rawAction as Record<string, unknown>;
-    const href = getDoctorString(action.href);
+    const href = normalizeAIHealthNavigationHref(getDoctorString(action.href));
     const allowedRoute = allowedByHref.get(href);
 
     if (!allowedRoute) {
