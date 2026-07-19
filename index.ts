@@ -4238,7 +4238,7 @@ const createAIHealthMessageId = (): string => {
   return new ObjectId().toHexString();
 };
 
-const getAIHealthArray = (value: unknown, maximumItems = 6): string[] => {
+const getAIHealthArray = (value: unknown, maximumItems = 8): string[] => {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -4549,17 +4549,17 @@ const formatAIHealthAssistantResponse = (
   return {
     reply,
     urgencyLevel,
-    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 2),
-    recommendedActions: getAIHealthArray(data.recommendedActions, 3),
+    suggestedSpecialists: getAIHealthArray(data.suggestedSpecialists, 3),
+    recommendedActions: getAIHealthArray(data.recommendedActions, 5),
     warningSigns: emergencyDetected
       ? Array.from(
           new Set([
             "Your description may include an emergency warning sign.",
-            ...getAIHealthArray(data.warningSigns, 3),
+            ...getAIHealthArray(data.warningSigns, 4),
           ]),
-        ).slice(0, 3)
-      : getAIHealthArray(data.warningSigns, 3),
-    followUpQuestions: getAIHealthArray(data.followUpQuestions, 2),
+        ).slice(0, 4)
+      : getAIHealthArray(data.warningSigns, 4),
+    followUpQuestions: getAIHealthArray(data.followUpQuestions, 3),
     disclaimer:
       getDoctorString(data.disclaimer) ||
       "General guidance only; this is not a diagnosis or prescription.",
@@ -5128,27 +5128,30 @@ app.post(
 
       const systemPrompt = `You are SebaSathi AI Health Assistant for a Bangladesh-oriented healthcare platform. The user's name is ${userName}.
 
-Give cautious general health guidance and suggest an appropriate doctor category. Never diagnose, prescribe medicines, give doses, or tell the user to stop prescribed treatment.
+Provide empathetic, clear and practical general health guidance. Explain the situation in a natural conversational way, including what the symptoms may generally relate to without claiming a diagnosis, why a particular doctor category may be appropriate, and what safe next steps the user can take.
 
-Keep every response compact:
-- reply: maximum 3 short sentences and preferably under 80 words
-- suggestedSpecialists: maximum 2
-- recommendedActions: maximum 3
-- warningSigns: maximum 3
-- followUpQuestions: maximum 2
-- avoid repeating the same disclaimer or advice in multiple fields
-- match Bangla, Banglish, or English used by the user
-- emergency warning signs require immediate emergency-care advice
+Mandatory safety rules:
+- Never diagnose a disease or present a condition as confirmed.
+- Never prescribe medicine, antibiotics, controlled drugs or individualized doses.
+- Never tell the user to stop prescribed treatment.
+- Match the user's language: easy Bangla, Banglish or English.
+- The reply should usually be 5-8 clear sentences and around 120-220 words when enough information is available.
+- Keep the explanation useful but avoid unnecessary repetition.
+- suggestedSpecialists: maximum 3 relevant categories.
+- recommendedActions: maximum 5 practical low-risk steps.
+- warningSigns: maximum 4 important signs.
+- followUpQuestions: maximum 3 useful questions.
+- Emergency warning signs require clear immediate emergency-care advice.
 
 Return ONLY valid JSON:
 {
-  "reply": "brief empathetic answer",
+  "reply": "warm, well-explained conversational guidance",
   "urgencyLevel": "routine | soon | urgent | emergency",
-  "suggestedSpecialists": ["maximum two specialist categories"],
-  "recommendedActions": ["maximum three concise actions"],
-  "warningSigns": ["maximum three warning signs"],
-  "followUpQuestions": ["maximum two useful questions"],
-  "disclaimer": "one short disclaimer"
+  "suggestedSpecialists": ["maximum three relevant specialist categories"],
+  "recommendedActions": ["maximum five practical actions"],
+  "warningSigns": ["maximum four important warning signs"],
+  "followUpQuestions": ["maximum three useful questions"],
+  "disclaimer": "one short medical disclaimer"
 }`;
 
       const groqData = await callGroqAI(
@@ -5160,7 +5163,7 @@ Return ONLY valid JSON:
           ...validation.messages,
         ],
         0.2,
-        650,
+        1000,
       );
 
       const assistant = formatAIHealthAssistantResponse(
@@ -5259,12 +5262,12 @@ app.post(
       }
 
       const emergencyDetected = hasEmergencyWarning(validation.messages);
-      const systemPrompt = `You are SebaSathi AI Health Assistant. Never diagnose or prescribe. Reply in maximum 3 short sentences, then return maximum 2 specialists, 3 actions, 3 warnings and 2 follow-up questions. Match the user's language. Return only JSON with reply, urgencyLevel, suggestedSpecialists, recommendedActions, warningSigns, followUpQuestions and disclaimer.`;
+      const systemPrompt = `You are SebaSathi AI Health Assistant. Give a warm, natural and well-explained general health response in the user's Bangla, Banglish or English. Usually write 5-8 clear sentences, explain which doctor category may be suitable and why, and provide safe next steps. Never diagnose, prescribe medicine, give doses or stop prescribed treatment. Return only JSON with reply, urgencyLevel, suggestedSpecialists, recommendedActions, warningSigns, followUpQuestions and disclaimer.`;
 
       const groqData = await callGroqAI(
         [{ role: "system", content: systemPrompt }, ...validation.messages],
         0.2,
-        650,
+        1000,
       );
 
       res.status(200).json({
