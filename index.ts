@@ -3177,10 +3177,15 @@ app.patch(
 
       const currentStatus = getDoctorString(appointment.status);
 
-      if (currentStatus !== "pending" && currentStatus !== "approved") {
+      if (
+        currentStatus !== "pending" &&
+        currentStatus !== "approved" &&
+        currentStatus !== "rejected"
+      ) {
         res.status(409).json({
           success: false,
-          message: "Only pending or approved appointments can be rescheduled",
+          message:
+            "Only pending, approved or rejected appointments can be rescheduled",
         });
 
         return;
@@ -3471,10 +3476,10 @@ app.patch(
 
       const currentStatus = getDoctorString(appointment.status);
 
-      if (currentStatus === "completed" || currentStatus === "rejected") {
+      if (currentStatus === "completed") {
         res.status(409).json({
           success: false,
-          message: "A completed or rejected appointment cannot be changed",
+          message: "A completed appointment cannot be changed",
         });
 
         return;
@@ -3489,13 +3494,53 @@ app.patch(
         return;
       }
 
-      if (requestedStatus === "approved" && currentStatus !== "pending") {
+      if (
+        requestedStatus === "approved" &&
+        currentStatus !== "pending" &&
+        currentStatus !== "rejected"
+      ) {
         res.status(409).json({
           success: false,
-          message: "Only a pending appointment can be approved",
+          message: "Only a pending or rejected appointment can be approved",
         });
 
         return;
+      }
+
+      if (
+        requestedStatus === "rejected" &&
+        currentStatus !== "pending" &&
+        currentStatus !== "approved"
+      ) {
+        res.status(409).json({
+          success: false,
+          message: "Only a pending or approved appointment can be rejected",
+        });
+
+        return;
+      }
+
+      if (requestedStatus === "approved" && currentStatus === "rejected") {
+        const anotherActiveAppointment = await appointmentsCollection.findOne({
+          _id: {
+            $ne: appointment._id,
+          },
+          doctorId: getDoctorString(appointment.doctorId),
+          patientUserId: getDoctorString(appointment.patientUserId),
+          status: {
+            $in: ACTIVE_APPOINTMENT_STATUSES,
+          },
+        });
+
+        if (anotherActiveAppointment) {
+          res.status(409).json({
+            success: false,
+            message:
+              "This patient already has another pending or approved appointment with you.",
+          });
+
+          return;
+        }
       }
 
       const now = new Date();
@@ -3509,6 +3554,8 @@ app.patch(
 
       if (requestedStatus === "approved") {
         statusFields.approvedAt = now;
+        statusFields.rejectedAt = null;
+        statusFields.rejectionReason = null;
       }
 
       if (requestedStatus === "completed") {
