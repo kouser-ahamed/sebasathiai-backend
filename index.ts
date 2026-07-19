@@ -2757,7 +2757,159 @@ app.post(
 );
 
 /* =========================================================
-   Patient appointments
+   Patient appointment helpers
+========================================================= */
+
+const getPatientAppointment = async (
+  patientUserId: string,
+  appointmentId: string,
+): Promise<Document | null> => {
+  if (!database) {
+    return null;
+  }
+
+  return database.collection("appointments").findOne({
+    $and: [
+      getDoctorFilter(appointmentId),
+      {
+        patientUserId,
+      },
+    ],
+  });
+};
+
+const getAppointmentDoctor = async (
+  appointment: Document,
+): Promise<Document | null> => {
+  if (!database) {
+    return null;
+  }
+
+  const doctorId = getDoctorString(appointment.doctorId);
+
+  if (!doctorId) {
+    return null;
+  }
+
+  return database.collection("doctors").findOne(getDoctorFilter(doctorId));
+};
+
+const validatePatientAppointmentInput = (
+  body: Record<string, unknown>,
+):
+  | {
+      success: true;
+      values: {
+        patientName: string;
+        phone: string;
+        address: string;
+        problemTitle: string;
+        symptomsDescription: string;
+        appointmentDate: string;
+        appointmentTime: string;
+      };
+    }
+  | {
+      success: false;
+      message: string;
+    } => {
+  const patientName = getDoctorString(body.patientName);
+  const phone = getDoctorString(body.phone);
+  const address = getDoctorString(body.address);
+  const problemTitle = getDoctorString(body.problemTitle);
+  const symptomsDescription = getDoctorString(body.symptomsDescription);
+  const appointmentDate = getDoctorString(body.appointmentDate);
+  const appointmentTime = getDoctorString(body.appointmentTime);
+
+  if (
+    !patientName ||
+    !phone ||
+    !address ||
+    !problemTitle ||
+    !symptomsDescription ||
+    !appointmentDate ||
+    !appointmentTime
+  ) {
+    return {
+      success: false,
+      message:
+        "Patient name, phone, address, health problem title, symptoms description, appointment date and time are required.",
+    };
+  }
+
+  if (patientName.length > 150) {
+    return {
+      success: false,
+      message: "Patient name cannot contain more than 150 characters",
+    };
+  }
+
+  if (phone.length > 40) {
+    return {
+      success: false,
+      message: "Phone number cannot contain more than 40 characters",
+    };
+  }
+
+  if (address.length > 500) {
+    return {
+      success: false,
+      message: "Address cannot contain more than 500 characters",
+    };
+  }
+
+  if (problemTitle.length > 250) {
+    return {
+      success: false,
+      message: "Health problem title cannot contain more than 250 characters",
+    };
+  }
+
+  if (symptomsDescription.length > 5000) {
+    return {
+      success: false,
+      message: "Symptoms description cannot contain more than 5000 characters",
+    };
+  }
+
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const timePattern = /^\d{2}:\d{2}$/;
+
+  if (
+    !datePattern.test(appointmentDate) ||
+    !timePattern.test(appointmentTime)
+  ) {
+    return {
+      success: false,
+      message: "A valid appointment date and time are required",
+    };
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (appointmentDate < today) {
+    return {
+      success: false,
+      message: "Appointment date cannot be in the past",
+    };
+  }
+
+  return {
+    success: true,
+    values: {
+      patientName,
+      phone,
+      address,
+      problemTitle,
+      symptomsDescription,
+      appointmentDate,
+      appointmentTime,
+    },
+  };
+};
+
+/* =========================================================
+   Patient appointments list
 ========================================================= */
 
 app.get(
@@ -2771,7 +2923,6 @@ app.get(
           success: false,
           message: "Database is not connected",
         });
-
         return;
       }
 
@@ -2782,32 +2933,313 @@ app.get(
           success: false,
           message: "User account was not found",
         });
-
         return;
       }
 
       const patientUserId = getDoctorDocumentId(currentUser);
+      const page = getPositiveInteger(req.query.page, 1, 100000);
+      const limit = 10;
+      const appointmentsCollection = database.collection("appointments");
+      const filter: Filter<Document> = { patientUserId };
 
-      const appointments = await database
-        .collection("appointments")
-        .find({
-          patientUserId,
-        })
-        .sort({
-          createdAt: -1,
-        })
-        .toArray();
+      const [appointmentDocuments, total] = await Promise.all([
+        appointmentsCollection
+          .find(filter)
+          .sort({ createdAt: -1, _id: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+        appointmentsCollection.countDocuments(filter),
+      ]);
 
       res.status(200).json({
         success: true,
-        appointments: appointments.map(formatAppointment),
+        appointments: appointmentDocuments.map(formatAppointment),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
       });
     } catch (error) {
       console.error("Get patient appointments error:", error);
-
       res.status(500).json({
         success: false,
         message: "Failed to retrieve appointments",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Patient single appointment details
+========================================================= */
+
+app.get(
+  "/api/v1/patient/appointments/:appointmentId",
+  verifyToken,
+  verifyPatient,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const appointmentId = getDoctorString(req.params.appointmentId);
+
+      if (!appointmentId) {
+        res.status(400).json({
+          success: false,
+          message: "Appointment ID is required",
+        });
+        return;
+      }
+
+      const appointment = await getPatientAppointment(
+        patientUserId,
+        appointmentId,
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+        return;
+      }
+
+      const doctor = await getAppointmentDoctor(appointment);
+
+      res.status(200).json({
+        success: true,
+        appointment: formatAppointment(appointment),
+        doctor: doctor ? getPublicDoctor(doctor) : null,
+      });
+    } catch (error) {
+      console.error("Get patient appointment details error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve appointment details",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Patient edit appointment
+========================================================= */
+
+app.patch(
+  "/api/v1/patient/appointments/:appointmentId",
+  verifyToken,
+  verifyPatient,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const appointmentId = getDoctorString(req.params.appointmentId);
+      const appointment = await getPatientAppointment(
+        patientUserId,
+        appointmentId,
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+        return;
+      }
+
+      const currentStatus = getDoctorString(appointment.status);
+
+      if (currentStatus !== "pending" && currentStatus !== "rejected") {
+        res.status(409).json({
+          success: false,
+          message: "Only pending or rejected appointments can be edited",
+        });
+        return;
+      }
+
+      const validation = validatePatientAppointmentInput(
+        req.body as Record<string, unknown>,
+      );
+
+      if (!validation.success) {
+        res.status(400).json({
+          success: false,
+          message: validation.message,
+        });
+        return;
+      }
+
+      if (currentStatus === "rejected") {
+        const anotherActiveAppointment = await database
+          .collection("appointments")
+          .findOne({
+            _id: { $ne: appointment._id },
+            doctorId: getDoctorString(appointment.doctorId),
+            patientUserId,
+            status: { $in: ACTIVE_APPOINTMENT_STATUSES },
+          });
+
+        if (anotherActiveAppointment) {
+          res.status(409).json({
+            success: false,
+            message:
+              "You already have another pending or approved appointment with this doctor.",
+          });
+          return;
+        }
+      }
+
+      const now = new Date();
+      const updatedAppointment = await database
+        .collection("appointments")
+        .findOneAndUpdate(
+          { _id: appointment._id },
+          {
+            $set: {
+              ...validation.values,
+              status: "pending",
+              rejectionReason: null,
+              rejectedAt: null,
+              approvedAt: null,
+              completedAt: null,
+              updatedAt: now,
+            },
+          },
+          { returnDocument: "after" },
+        );
+
+      res.status(200).json({
+        success: true,
+        message:
+          currentStatus === "rejected"
+            ? "Appointment updated and resubmitted successfully"
+            : "Appointment updated successfully",
+        appointment: updatedAppointment
+          ? formatAppointment(updatedAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Update patient appointment error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update appointment",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Patient cancel and delete appointment
+========================================================= */
+
+app.delete(
+  "/api/v1/patient/appointments/:appointmentId",
+  verifyToken,
+  verifyPatient,
+  verifyActive,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const patientUserId = getDoctorDocumentId(currentUser);
+      const appointmentId = getDoctorString(req.params.appointmentId);
+      const appointment = await getPatientAppointment(
+        patientUserId,
+        appointmentId,
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+        return;
+      }
+
+      if (getDoctorString(appointment.status) === "completed") {
+        res.status(409).json({
+          success: false,
+          message: "A completed appointment cannot be cancelled or deleted",
+        });
+        return;
+      }
+
+      const deleteResult = await database
+        .collection("appointments")
+        .deleteOne({ _id: appointment._id });
+
+      if (deleteResult.deletedCount !== 1) {
+        res.status(500).json({
+          success: false,
+          message: "Appointment could not be cancelled",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Appointment cancelled and removed successfully",
+        deletedAppointmentId: appointmentId,
+      });
+    } catch (error) {
+      console.error("Cancel patient appointment error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to cancel appointment",
       });
     }
   },
@@ -3652,6 +4084,9 @@ const connectDatabase = async (): Promise<void> => {
     database
       .collection("appointments")
       .createIndex({ patientUserId: 1, doctorId: 1, status: 1 }),
+    database
+      .collection("appointments")
+      .createIndex({ patientUserId: 1, createdAt: -1 }),
     database
       .collection("appointments")
       .createIndex({ doctorUserId: 1, status: 1, appointmentDate: 1 }),
