@@ -2258,6 +2258,97 @@ app.get(
   },
 );
 
+
+
+
+
+
+
+
+/* =========================================================
+   Top Rated Public Doctors
+========================================================= */
+
+app.get(
+  "/api/v1/doctors/top-rated",
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+
+      if (!database) {
+        res.status(503).json({
+          success:false,
+          message:"Database is not connected",
+        });
+
+        return;
+      }
+
+
+      const doctorsCollection =
+        database.collection("doctors");
+
+
+      const doctors =
+        await doctorsCollection
+          .find({
+            status:"active",
+          })
+          .sort({
+            ratingAverage:-1,
+            ratingCount:-1,
+            createdAt:-1,
+            _id:-1,
+          })
+          .limit(4)
+          .toArray();
+
+
+
+      res.status(200).json({
+
+        success:true,
+
+        doctors:
+          doctors.map(getPublicDoctor),
+
+      });
+
+
+
+    } catch(error){
+
+
+      console.error(
+        "Get top rated doctors error:",
+        error
+      );
+
+
+      res.status(500).json({
+
+        success:false,
+
+        message:
+        "Failed to retrieve top rated doctors",
+
+      });
+
+
+    }
+  },
+);
+
+
+
+
+
+
+
+
+
+
+
+
 /* =========================================================
    Public doctor list
 ========================================================= */
