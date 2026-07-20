@@ -4590,6 +4590,657 @@ app.patch(
   },
 );
 
+
+
+
+
+
+
+
+/* =========================================================
+   Admin or doctor appointment status update
+========================================================= */
+
+app.patch(
+  "/api/v1/appointments/:appointmentId/status",
+  verifyToken,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      const currentUser = await getCurrentDatabaseUser(req);
+
+      if (!currentUser) {
+        res.status(404).json({
+          success: false,
+          message: "User account was not found",
+        });
+        return;
+      }
+
+      const role = getNormalizedUserRole(currentUser);
+      const userStatus = getNormalizedUserStatus(currentUser);
+
+      if (role !== "admin" && role !== "doctor") {
+        res.status(403).json({
+          success: false,
+          message:
+            "Only an administrator or doctor can update appointment status.",
+        });
+        return;
+      }
+
+      if (userStatus === "blocked") {
+        res.status(403).json({
+          success: false,
+          message:
+            "Your account is blocked. You can view appointments but cannot update them.",
+          code: "READ_ONLY_ACCOUNT",
+        });
+        return;
+      }
+
+      const requestedStatus = getDoctorString(req.body.status);
+      const rejectionReason = getDoctorString(req.body.rejectionReason);
+
+      if (
+        requestedStatus !== "approved" &&
+        requestedStatus !== "completed" &&
+        requestedStatus !== "rejected"
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "Status must be approved, completed or rejected",
+        });
+        return;
+      }
+
+      if (requestedStatus === "rejected" && !rejectionReason) {
+        res.status(400).json({
+          success: false,
+          message:
+            "A rejection message is required when rejecting an appointment",
+        });
+        return;
+      }
+
+      if (rejectionReason.length > 1000) {
+        res.status(400).json({
+          success: false,
+          message: "Rejection message cannot contain more than 1000 characters",
+        });
+        return;
+      }
+
+      const appointmentId = getDoctorString(req.params.appointmentId);
+      const appointmentsCollection = database.collection("appointments");
+      const appointment = await appointmentsCollection.findOne(
+        getDoctorFilter(appointmentId),
+      );
+
+      if (!appointment) {
+        res.status(404).json({
+          success: false,
+          message: "Appointment was not found",
+        });
+        return;
+      }
+
+      if (role === "doctor") {
+        const currentUserId = getDoctorDocumentId(currentUser);
+        if (getDoctorString(appointment.doctorUserId) !== currentUserId) {
+          res.status(403).json({
+            success: false,
+            message: "You can update only your own appointments",
+          });
+          return;
+        }
+      }
+
+      const currentStatus = getDoctorString(appointment.status);
+
+      if (currentStatus === "completed") {
+        res.status(409).json({
+          success: false,
+          message: "A completed appointment cannot be changed",
+        });
+        return;
+      }
+
+      if (requestedStatus === "completed" && currentStatus !== "approved") {
+        res.status(409).json({
+          success: false,
+          message: "Only an approved appointment can be marked as completed",
+        });
+        return;
+      }
+
+      if (
+        requestedStatus === "approved" &&
+        currentStatus !== "pending" &&
+        currentStatus !== "rejected"
+      ) {
+        res.status(409).json({
+          success: false,
+          message: "Only a pending or rejected appointment can be approved",
+        });
+        return;
+      }
+
+      if (
+        requestedStatus === "rejected" &&
+        currentStatus !== "pending" &&
+        currentStatus !== "approved"
+      ) {
+        res.status(409).json({
+          success: false,
+          message: "Only a pending or approved appointment can be rejected",
+        });
+        return;
+      }
+
+      if (requestedStatus === "approved" && currentStatus === "rejected") {
+        const anotherActiveAppointment = await appointmentsCollection.findOne({
+          _id: {
+            $ne: appointment._id,
+          },
+          doctorId: getDoctorString(appointment.doctorId),
+          patientUserId: getDoctorString(appointment.patientUserId),
+          status: {
+            $in: ACTIVE_APPOINTMENT_STATUSES,
+          },
+        });
+
+        if (anotherActiveAppointment) {
+          res.status(409).json({
+            success: false,
+            message:
+              "This patient already has another pending or approved appointment with you.",
+          });
+          return;
+        }
+      }
+
+      const now = new Date();
+
+      const statusFields: Record<string, unknown> = {
+        status: requestedStatus as AppointmentStatus,
+        rejectionReason:
+          requestedStatus === "rejected" ? rejectionReason : null,
+        updatedAt: now,
+      };
+
+      if (requestedStatus === "approved") {
+        statusFields.approvedAt = now;
+        statusFields.rejectedAt = null;
+        statusFields.rejectionReason = null;
+      }
+
+      if (requestedStatus === "completed") {
+        statusFields.completedAt = now;
+      }
+
+      if (requestedStatus === "rejected") {
+        statusFields.rejectedAt = now;
+      }
+
+      const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
+        {
+          _id: appointment._id,
+        },
+        {
+          $set: statusFields,
+        },
+        {
+          returnDocument: "after",
+        },
+      );
+
+      res.status(200).json({
+        success: true,
+        message:
+          requestedStatus === "approved"
+            ? "Appointment approved successfully"
+            : requestedStatus === "completed"
+              ? "Consultation completed successfully."
+              : "Appointment rejected successfully",
+        appointment: updatedAppointment
+          ? formatAppointment(updatedAppointment)
+          : null,
+      });
+    } catch (error) {
+      console.error("Update appointment status error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update appointment status",
+      });
+    }
+  },
+);
+
+/* =========================================================
+   Admin Dashboard Statistics                               <-- ADD THIS HERE
+========================================================= */
+
+app.get(
+  "/api/v1/admin/dashboard/stats",
+  verifyToken,
+  verifyAdmin,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    console.log("✅ Admin dashboard stats route called!"); // Debug log
+    try {
+      if (!database) {
+        res.status(503).json({
+          success: false,
+          message: "Database is not connected",
+        });
+        return;
+      }
+
+      // Get total patients
+      const totalPatients = await database
+        .collection("user")
+        .countDocuments({ role: "patient" });
+
+      // Get active patients
+      const activePatients = await database
+        .collection("user")
+        .countDocuments({ role: "patient", status: "active" });
+
+      // Get blocked patients
+      const blockedPatients = await database
+        .collection("user")
+        .countDocuments({ role: "patient", status: "blocked" });
+
+      // Get total doctors
+      const totalDoctors = await database
+        .collection("doctors")
+        .countDocuments();
+
+      // Get active doctors
+      const activeDoctors = await database
+        .collection("doctors")
+        .countDocuments({ status: "active" });
+
+      // Get blocked doctors
+      const blockedDoctors = await database
+        .collection("doctors")
+        .countDocuments({ status: "blocked" });
+
+      // Get appointment counts by status
+      const appointmentCounts = await database
+        .collection("appointments")
+        .aggregate([
+          {
+            $group: {
+              _id: "$status",
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      // Create status count object with default values
+      const statusCounts: Record<string, number> = {
+        pending: 0,
+        approved: 0,
+        completed: 0,
+        rejected: 0,
+      };
+
+      appointmentCounts.forEach((item) => {
+        const status = item._id || "pending";
+        if (status in statusCounts) {
+          statusCounts[status] = item.count;
+        }
+      });
+
+      // Get total appointments
+      const totalAppointments = await database
+        .collection("appointments")
+        .countDocuments();
+
+      // Get completed consultations
+      const completedConsultations = statusCounts.completed;
+
+      // Get monthly appointment trends (last 6 months)
+      const sixMonthsAgo = new Date();
+      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+      const monthlyTrends = await database
+        .collection("appointments")
+        .aggregate([
+          {
+            $match: {
+              createdAt: { $gte: sixMonthsAgo },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                year: { $year: "$createdAt" },
+                month: { $month: "$createdAt" },
+              },
+              count: { $sum: 1 },
+              pending: {
+                $sum: {
+                  $cond: [{ $eq: ["$status", "pending"] }, 1, 0],
+                },
+              },
+              approved: {
+                $sum: {
+                  $cond: [{ $eq: ["$status", "approved"] }, 1, 0],
+                },
+              },
+              completed: {
+                $sum: {
+                  $cond: [{ $eq: ["$status", "completed"] }, 1, 0],
+                },
+              },
+              rejected: {
+                $sum: {
+                  $cond: [{ $eq: ["$status", "rejected"] }, 1, 0],
+                },
+              },
+            },
+          },
+          {
+            $sort: { "_id.year": 1, "_id.month": 1 },
+          },
+        ])
+        .toArray();
+
+      // Get appointment status breakdown for charts
+      const statusColors: Record<string, string> = {
+        pending: "#FBBF24",
+        approved: "#60A5FA",
+        completed: "#34D399",
+        rejected: "#F87171",
+      };
+
+      const statusData = appointmentCounts.map((item) => ({
+        name: item._id || "unknown",
+        value: item.count,
+        fill: statusColors[item._id] || "#9CA3AF",
+      }));
+
+      // Format monthly data for charts
+      const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      const monthlyData = monthlyTrends.map((item) => ({
+        month: `${monthNames[item._id.month - 1]} ${item._id.year}`,
+        pending: item.pending || 0,
+        approved: item.approved || 0,
+        completed: item.completed || 0,
+        rejected: item.rejected || 0,
+        total: item.count || 0,
+      }));
+
+      // Get recent appointments (last 10)
+      const recentAppointments = await database
+        .collection("appointments")
+        .find()
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          overview: {
+            totalPatients,
+            activePatients,
+            blockedPatients,
+            totalDoctors,
+            activeDoctors,
+            blockedDoctors,
+            totalAppointments,
+            completedConsultations,
+            appointmentStatus: statusCounts,
+          },
+          charts: {
+            appointmentStatus: statusData,
+            monthlyTrends: monthlyData,
+          },
+          recentAppointments: recentAppointments.map((app) => ({
+            id: app._id,
+            patientName: app.patientName,
+            doctorName: app.doctorName,
+            specialization: app.specialization,
+            appointmentDate: app.appointmentDate,
+            appointmentTime: app.appointmentTime,
+            status: app.status,
+            createdAt: app.createdAt,
+          })),
+        },
+      });
+    } catch (error) {
+      console.error("Dashboard stats error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch dashboard statistics",
+      });
+    }
+  },
+);
+
+
+/* =========================================================
+   Admin Dashboard Statistics                         <-- ADD THIS HERE
+========================================================= */
+
+// app.get(
+//   "/api/v1/admin/dashboard/stats",
+//   verifyToken,
+//   verifyAdmin,
+//   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+//     console.log("✅ Admin dashboard stats route called!"); // Debug log
+//     try {
+//       if (!database) {
+//         res.status(503).json({
+//           success: false,
+//           message: "Database is not connected",
+//         });
+//         return;
+//       }
+
+//       // Get total patients
+//       const totalPatients = await database
+//         .collection("user")
+//         .countDocuments({ role: "patient" });
+
+//       // Get active patients
+//       const activePatients = await database
+//         .collection("user")
+//         .countDocuments({ role: "patient", status: "active" });
+
+//       // Get blocked patients
+//       const blockedPatients = await database
+//         .collection("user")
+//         .countDocuments({ role: "patient", status: "blocked" });
+
+//       // Get total doctors
+//       const totalDoctors = await database
+//         .collection("doctors")
+//         .countDocuments();
+
+//       // Get active doctors
+//       const activeDoctors = await database
+//         .collection("doctors")
+//         .countDocuments({ status: "active" });
+
+//       // Get blocked doctors
+//       const blockedDoctors = await database
+//         .collection("doctors")
+//         .countDocuments({ status: "blocked" });
+
+//       // Get appointment counts by status
+//       const appointmentCounts = await database
+//         .collection("appointments")
+//         .aggregate([
+//           {
+//             $group: {
+//               _id: "$status",
+//               count: { $sum: 1 },
+//             },
+//           },
+//         ])
+//         .toArray();
+
+//       // Create status count object with default values
+//       const statusCounts: Record<string, number> = {
+//         pending: 0,
+//         approved: 0,
+//         completed: 0,
+//         rejected: 0,
+//       };
+
+//       appointmentCounts.forEach((item) => {
+//         const status = item._id || "pending";
+//         if (status in statusCounts) {
+//           statusCounts[status] = item.count;
+//         }
+//       });
+
+//       // Get total appointments
+//       const totalAppointments = await database
+//         .collection("appointments")
+//         .countDocuments();
+
+//       // Get completed consultations
+//       const completedConsultations = statusCounts.completed;
+
+//       // Get monthly appointment trends (last 6 months)
+//       const sixMonthsAgo = new Date();
+//       sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+//       const monthlyTrends = await database
+//         .collection("appointments")
+//         .aggregate([
+//           {
+//             $match: {
+//               createdAt: { $gte: sixMonthsAgo },
+//             },
+//           },
+//           {
+//             $group: {
+//               _id: {
+//                 year: { $year: "$createdAt" },
+//                 month: { $month: "$createdAt" },
+//               },
+//               count: { $sum: 1 },
+//               pending: {
+//                 $sum: {
+//                   $cond: [{ $eq: ["$status", "pending"] }, 1, 0],
+//                 },
+//               },
+//               approved: {
+//                 $sum: {
+//                   $cond: [{ $eq: ["$status", "approved"] }, 1, 0],
+//                 },
+//               },
+//               completed: {
+//                 $sum: {
+//                   $cond: [{ $eq: ["$status", "completed"] }, 1, 0],
+//                 },
+//               },
+//               rejected: {
+//                 $sum: {
+//                   $cond: [{ $eq: ["$status", "rejected"] }, 1, 0],
+//                 },
+//               },
+//             },
+//           },
+//           {
+//             $sort: { "_id.year": 1, "_id.month": 1 },
+//           },
+//         ])
+//         .toArray();
+
+//       // Get appointment status breakdown for charts
+//       const statusColors: Record<string, string> = {
+//         pending: "#FBBF24",
+//         approved: "#60A5FA",
+//         completed: "#34D399",
+//         rejected: "#F87171",
+//       };
+
+//       const statusData = appointmentCounts.map((item) => ({
+//         name: item._id || "unknown",
+//         value: item.count,
+//         fill: statusColors[item._id] || "#9CA3AF",
+//       }));
+
+//       // Format monthly data for charts
+//       const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+//       const monthlyData = monthlyTrends.map((item) => ({
+//         month: `${monthNames[item._id.month - 1]} ${item._id.year}`,
+//         pending: item.pending || 0,
+//         approved: item.approved || 0,
+//         completed: item.completed || 0,
+//         rejected: item.rejected || 0,
+//         total: item.count || 0,
+//       }));
+
+//       // Get recent appointments (last 10)
+//       const recentAppointments = await database
+//         .collection("appointments")
+//         .find()
+//         .sort({ createdAt: -1 })
+//         .limit(10)
+//         .toArray();
+
+//       res.status(200).json({
+//         success: true,
+//         data: {
+//           overview: {
+//             totalPatients,
+//             activePatients,
+//             blockedPatients,
+//             totalDoctors,
+//             activeDoctors,
+//             blockedDoctors,
+//             totalAppointments,
+//             completedConsultations,
+//             appointmentStatus: statusCounts,
+//           },
+//           charts: {
+//             appointmentStatus: statusData,
+//             monthlyTrends: monthlyData,
+//           },
+//           recentAppointments: recentAppointments.map((app) => ({
+//             id: app._id,
+//             patientName: app.patientName,
+//             doctorName: app.doctorName,
+//             specialization: app.specialization,
+//             appointmentDate: app.appointmentDate,
+//             appointmentTime: app.appointmentTime,
+//             status: app.status,
+//             createdAt: app.createdAt,
+//           })),
+//         },
+//       });
+//     } catch (error) {
+//       console.error("Dashboard stats error:", error);
+//       res.status(500).json({
+//         success: false,
+//         message: "Failed to fetch dashboard statistics",
+//       });
+//     }
+//   },
+// );
+
+
+
+
+
+
+
 /* =========================================================
    SebaSathi AI Health Assistant (Groq)
 ========================================================= */
